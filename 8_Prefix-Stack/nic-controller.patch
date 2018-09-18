@@ -1,0 +1,29 @@
+diff --git a/templates/nic-configs/controller.yaml b/templates/nic-configs/controller.yaml
+index 03fe320..17651c1 100644
+--- a/templates/nic-configs/controller.yaml
++++ b/templates/nic-configs/controller.yaml
+@@ -84,8 +84,8 @@ resources:
+           params:
+             $network_config:
+               network_config:
+-              - type: ovs_bridge
+-                name: bridge_name
++              - type: interface
++                name: nic1
+                 use_dhcp: false
+                 dns_servers:
+                   get_param: DnsServers
+@@ -99,9 +99,12 @@ resources:
+                 - ip_netmask: 169.254.169.254/32
+                   next_hop:
+                     get_param: EC2MetadataIp
++              - type: ovs_bridge
++                name: bridge_name
++                use_dhcp: false
+                 members:
+                 - type: interface
+-                  name: nic1
++                  name: nic2
+                   # force the MAC address of the bridge to this interface
+                   primary: true
+                 - type: vlan

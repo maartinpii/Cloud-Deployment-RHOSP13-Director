@@ -1,0 +1,346 @@
+heat_template_version: queens
+
+description: >
+  OpenStack containerized gnocchi service
+
+parameters:
+  DockerGnocchiApiImage:
+    description: image
+    type: string
+  DockerGnocchiConfigImage:
+    description: The container image to use for the gnocchi config_volume
+    type: string
+  EndpointMap:
+    default: {}
+    description: Mapping of service endpoint -> protocol. Typically set
+                 via parameter_defaults in the resource registry.
+    type: json
+  ServiceData:
+    default: {}
+    description: Dictionary packing service data
+    type: json
+  ServiceNetMap:
+    default: {}
+    description: Mapping of service_name -> network name. Typically set
+                 via parameter_defaults in the resource registry.  This
+                 mapping overrides those in ServiceNetMapDefaults.
+    type: json
+  DefaultPasswords:
+    default: {}
+    type: json
+  RoleName:
+    default: ''
+    description: Role name on which the service is applied
+    type: string
+  RoleParameters:
+    default: {}
+    description: Parameters specific to the role
+    type: json
+  EnableInternalTLS:
+    type: boolean
+    default: false
+  NumberOfStorageSacks:
+    default: 128
+    description: Number of storage sacks to create.
+    type: number
+  CephClientUserName:
+    default: openstack
+    type: string
+  CephClusterName:
+    type: string
+    default: ceph
+    description: The Ceph cluster name.
+    constraints:
+    - allowed_pattern: "[a-zA-Z0-9]+"
+      description: >
+        The Ceph cluster name must be at least 1 character and contain only
+        letters and numbers.
+  GnocchiFileBasePath:
+    default: '/var/lib/gnocchi'
+    description: Path to use when file driver is used. This could be NFS or a
+      flat file.
+    type: string
+
+conditions:
+
+  internal_tls_enabled: {equals: [{get_param: EnableInternalTLS}, true]}
+
+resources:
+
+  ContainersCommon:
+    type: ./containers-common.yaml
+
+  GnocchiApiPuppetBase:
+      type: ../../puppet/services/gnocchi-api.yaml
+      properties:
+        EndpointMap: {get_param: EndpointMap}
+        ServiceNetMap: {get_param: ServiceNetMap}
+        DefaultPasswords: {get_param: DefaultPasswords}
+        RoleName: {get_param: RoleName}
+        RoleParameters: {get_param: RoleParameters}
+
+outputs:
+  role_data:
+    description: Role data for the gnocchi API role.
+    value:
+      service_name: {get_attr: [GnocchiApiPuppetBase, role_data, service_name]}
+      config_settings:
+        map_merge:
+          - get_attr: [GnocchiApiPuppetBase, role_data, config_settings]
+          - apache::default_vhost: false
+      logging_source: {get_attr: [GnocchiApiPuppetBase, role_data, logging_source]}
+      logging_groups: {get_attr: [GnocchiApiPuppetBase, role_data, logging_groups]}
+      service_config_settings: {get_attr: [GnocchiApiPuppetBase, role_data, service_config_settings]}
+      # BEGIN DOCKER SETTINGS
+      puppet_config:
+        config_volume: gnocchi
+        puppet_tags: gnocchi_api_paste_ini,gnocchi_config
+        step_config:
+          get_attr: [GnocchiApiPuppetBase, role_data, step_config]
+        config_image: {get_param: DockerGnocchiConfigImage}
+      kolla_config:
+        /var/lib/kolla/config_files/gnocchi_api.json:
+          command: /usr/sbin/httpd -DFOREGROUND
+          config_files: &gnocchi_api_kolla_config_files
+            - source: "/var/lib/kolla/config_files/src/*"
+              dest: "/"
+              merge: true
+              preserve_properties: true
+            - source: "/var/lib/kolla/config_files/src-ceph/"
+              dest: "/etc/ceph/"
+              merge: true
+              preserve_properties: true
+          permissions: &gnocchi_api_kolla_permissions
+            - path: /var/log/gnocchi
+              owner: gnocchi:gnocchi
+              recurse: true
+            - path:
+                str_replace:
+                  template: /etc/ceph/CLUSTER.client.USER.keyring
+                  params:
+                    CLUSTER: {get_param: CephClusterName}
+                    USER: {get_param: CephClientUserName}
+              owner: gnocchi:gnocchi
+              perm: '0600'
+        /var/lib/kolla/config_files/gnocchi_db_sync.json:
+          command:
+            str_replace:
+              template: /usr/bin/bootstrap_host_exec gnocchi_api /usr/bin/gnocchi-upgrade --sacks-number=SACK_NUM
+              params:
+                SACK_NUM: {get_param: NumberOfStorageSacks}
+          config_files: *gnocchi_api_kolla_config_files
+          permissions: *gnocchi_api_kolla_permissions
+      docker_config:
+        # db sync runs before permissions set by kolla_config
+        step_2:
+          gnocchi_init_log:
+            image: &gnocchi_api_image {get_param: DockerGnocchiApiImage}
+            user: root
+            volumes:
+              - /var/log/containers/gnocchi:/var/log/gnocchi
+              - /var/log/containers/httpd/gnocchi-api:/var/log/httpd
+            command: ['/bin/bash', '-c', 'chown -R gnocchi:gnocchi /var/log/gnocchi']
+          gnocchi_init_lib:
+            image: *gnocchi_api_image
+            user: root
+            volumes:
+              - str_replace:
+                  template: GNOCCHI_FILE_BASE_PATH:GNOCCHI_FILE_BASE_PATH
+                  params: {GNOCCHI_FILE_BASE_PATH: {get_param: GnocchiFileBasePath}}
+            command:
+              - '/bin/bash'
+              - '-c'
+              - str_replace:
+                  template: 'chown -R gnocchi:gnocchi GNOCCHI_FILE_BASE_PATH'
+                  params: {GNOCCHI_FILE_BASE_PATH: {get_param: GnocchiFileBasePath}}
+        step_5:
+          gnocchi_db_sync:
+            start_order: 0
+            image: *gnocchi_api_image
+            net: host
+            detach: false
+            privileged: false
+            user: root
+            volumes:
+              list_concat:
+                - {get_attr: [ContainersCommon, volumes]}
+                -
+                  - /var/lib/kolla/config_files/gnocchi_db_sync.json:/var/lib/kolla/config_files/config.json:ro
+                  - /var/lib/config-data/puppet-generated/gnocchi/:/var/lib/kolla/config_files/src:ro
+                  - str_replace:
+                      template: GNOCCHI_FILE_BASE_PATH:GNOCCHI_FILE_BASE_PATH
+                      params: {GNOCCHI_FILE_BASE_PATH: {get_param: GnocchiFileBasePath}}
+                  - /var/log/containers/gnocchi:/var/log/gnocchi
+                  - /var/log/containers/httpd/gnocchi-api:/var/log/httpd
+                  - /etc/ceph:/var/lib/kolla/config_files/src-ceph:ro
+            environment:
+              - KOLLA_CONFIG_STRATEGY=COPY_ALWAYS
+          gnocchi_api:
+            image: *gnocchi_api_image
+            start_order: 1
+            net: host
+            privileged: false
+            restart: always
+            healthcheck:
+              test: /openstack/healthcheck
+            volumes:
+              list_concat:
+                - {get_attr: [ContainersCommon, volumes]}
+                -
+                  - str_replace:
+                      template: GNOCCHI_FILE_BASE_PATH:GNOCCHI_FILE_BASE_PATH
+                      params: {GNOCCHI_FILE_BASE_PATH: {get_param: GnocchiFileBasePath}}
+                  - /var/lib/kolla/config_files/gnocchi_api.json:/var/lib/kolla/config_files/config.json:ro
+                  - /var/lib/config-data/puppet-generated/gnocchi/:/var/lib/kolla/config_files/src:ro
+                  - /var/log/containers/gnocchi:/var/log/gnocchi
+                  - /var/log/containers/httpd/gnocchi-api:/var/log/httpd
+                  - /etc/ceph:/var/lib/kolla/config_files/src-ceph:ro
+                  -
+                    if:
+                      - internal_tls_enabled
+                      - /etc/pki/tls/certs/httpd:/etc/pki/tls/certs/httpd:ro
+                      - ''
+                  -
+                    if:
+                      - internal_tls_enabled
+                      - /etc/pki/tls/private/httpd:/etc/pki/tls/private/httpd:ro
+                      - ''
+            environment:
+              - KOLLA_CONFIG_STRATEGY=COPY_ALWAYS
+      host_prep_tasks:
+        - name: create persistent logs directory
+          file:
+            path: "{{ item }}"
+            state: directory
+          with_items:
+            - /var/log/containers/gnocchi
+            - /var/log/containers/httpd/gnocchi-api
+        - name: gnocchi logs readme
+          copy:
+            dest: /var/log/gnocchi/readme.txt
+            content: |
+              Log files from gnocchi containers can be found under
+              /var/log/containers/gnocchi and /var/log/containers/httpd/gnocchi-api.
+          ignore_errors: true
+        - name: ensure ceph configurations exist
+          file:
+            path: /etc/ceph
+            state: directory
+      upgrade_tasks:
+        - name: Check if gnocchi_api is deployed
+          command: systemctl is-enabled --quiet openstack-gnocchi-api
+          tags: common
+          ignore_errors: True
+          register: gnocchi_api_enabled
+        - name: Check for gnocchi_api running under apache
+          tags: common
+          shell: "httpd -t -D DUMP_VHOSTS | grep -q gnocchi"
+          ignore_errors: True
+          register: httpd_enabled
+        - name: "PreUpgrade step0,validation: Check service openstack-gnocchi-api is running"
+          command: systemctl is-active --quiet openstack-gnocchi-api
+          when:
+            - step|int == 0
+            - gnocchi_api_enabled.rc == 0
+            - httpd_enabled.rc != 0
+          tags: validation
+        - name: Stop and disable gnocchi_api service
+          service: name=openstack-gnocchi-api state=stopped enabled=no
+          when:
+            - step|int == 2
+            - gnocchi_api_enabled.rc == 0
+            - httpd_enabled.rc != 0
+        - name: Check if httpd service is running
+          command: systemctl is-active --quiet httpd
+          tags: common
+          ignore_errors: True
+          register: httpd_running
+        - name: "PreUpgrade step0,validation: Check if gnocchi_api_wsgi is running"
+          shell: systemctl status 'httpd' | grep -q gnocchi
+          tags: validation
+          when:
+            - step|int == 0
+            - httpd_enabled.rc == 0
+            - httpd_running.rc == 0
+        - name: Stop and disable httpd service
+          when:
+            - step|int == 2
+            - httpd_enabled.rc == 0
+            - httpd_running.rc == 0
+          service: name=httpd state=stopped enabled=no
+      metadata_settings:
+        get_attr: [GnocchiApiPuppetBase, role_data, metadata_settings]
+      fast_forward_upgrade_tasks:
+        - name: Check if httpd service is running
+          command: systemctl is-active --quiet httpd
+          tags: common
+          ignore_errors: True
+          register: httpd_running_result
+          when:
+            - step|int == 0
+            - release == 'ocata'
+            - httpd_running is undefined
+        - name: Set fact httpd_running if unset
+          set_fact:
+            httpd_running: "{{ httpd_running_result.rc == 0 }}"
+          when:
+            - step|int == 0
+            - release == 'ocata'
+            - httpd_running is undefined
+        - name: Check if gnocchi_api is deployed
+          command: systemctl is-enabled --quiet openstack-gnocchi-api
+          tags: common
+          ignore_errors: True
+          register: gnocchi_api_enabled_result
+          when:
+            - step|int == 0
+            - release == 'ocata'
+        - name: Set fact gnocchi_api_enabled
+          set_fact:
+            gnocchi_api_enabled: "{{ gnocchi_api_enabled_result.rc == 0 }}"
+          when:
+            - step|int == 0
+            - release == 'ocata'
+        - name: Check for gnocchi_api running under apache
+          tags: common
+          shell: "httpd -t -D DUMP_VHOSTS | grep -q gnocchi"
+          ignore_errors: True
+          register: gnocchi_httpd_enabled_result
+          when:
+            - step|int == 0
+            - release == 'ocata'
+        - name: Set fact gnocchi_httpd_enabled
+          set_fact:
+            gnocchi_httpd_enabled: "{{ gnocchi_httpd_enabled_result.rc == 0 }}"
+          when:
+            - step|int == 0
+            - release == 'ocata'
+        - name: Stop and disable gnocchi_api service
+          service: name=openstack-gnocchi-api state=stopped enabled=no
+          when:
+            - step|int == 1
+            - release == 'ocata'
+            - gnocchi_api_enabled|bool
+        - name: Stop and disable httpd service
+          when:
+            - step|int == 1
+            - release == 'ocata'
+            - gnocchi_httpd_enabled|bool
+            - httpd_running|bool
+          service: name=httpd state=stopped enabled=no
+        - name: Update gnocchi packages
+          yum: name={{ item }} state=latest
+          # (pradk): We have to explicitly update numpy as its obsoleted
+          # by python2-numpy.
+          with_items:
+            - openstack-gnocchi*
+            - numpy
+          when:
+            - step|int == 6
+            - is_bootstrap_node|bool
+        - name: Sync gnocchi DB
+          command: gnocchi-upgrade --skip-storage
+          when:
+            - step|int == 8
+            - is_bootstrap_node|bool
+            - gnocchi_api_enabled|bool

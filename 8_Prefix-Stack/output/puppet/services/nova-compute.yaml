@@ -1,0 +1,290 @@
+heat_template_version: queens
+
+description: >
+  OpenStack Nova Compute service configured with Puppet
+
+parameters:
+  ServiceData:
+    default: {}
+    description: Dictionary packing service data
+    type: json
+  ServiceNetMap:
+    default: {}
+    description: Mapping of service_name -> network name. Typically set
+                 via parameter_defaults in the resource registry.  This
+                 mapping overrides those in ServiceNetMapDefaults.
+    type: json
+  DefaultPasswords:
+    default: {}
+    type: json
+  RoleName:
+    default: ''
+    description: Role name on which the service is applied
+    type: string
+  RoleParameters:
+    default: {}
+    description: Parameters specific to the role
+    type: json
+  EndpointMap:
+    default: {}
+    description: Mapping of service endpoint -> protocol. Typically set
+                 via parameter_defaults in the resource registry.
+    type: json
+  NovaRbdPoolName:
+    default: vms
+    type: string
+  CephClusterName:
+    type: string
+    default: ceph
+    description: The Ceph cluster name.
+    constraints:
+    - allowed_pattern: "[a-zA-Z0-9]+"
+      description: >
+        The Ceph cluster name must be at least 1 character and contain only
+        letters and numbers.
+  CephClientUserName:
+    default: openstack
+    type: string
+  CephClientKey:
+    description: The Ceph client key. Can be created with ceph-authtool --gen-print-key.
+    type: string
+    hidden: true
+  CephClusterFSID:
+    type: string
+    description: The Ceph cluster FSID. Must be a UUID.
+  CinderEnableNfsBackend:
+    default: false
+    description: Whether to enable or not the NFS backend for Cinder
+    type: boolean
+  NovaNfsEnabled:
+    default: false
+    description: Whether to enable or not the NFS backend for Nova
+    type: boolean
+  NovaNfsShare:
+    default: ''
+    description: NFS share to mount for nova storage (when NovaNfsEnabled is true)
+    type: string
+  NovaNfsOptions:
+    default: 'context=system_u:object_r:nova_var_lib_t:s0'
+    description: NFS mount options for nova storage (when NovaNfsEnabled is true)
+    type: string
+  CinderEnableRbdBackend:
+    default: false
+    description: Whether to enable or not the Rbd backend for Cinder
+    type: boolean
+  NovaEnableRbdBackend:
+    default: false
+    description: Whether to enable or not the Rbd backend for Nova
+    type: boolean
+  NovaComputeLibvirtVifDriver:
+    default: ''
+    description: Libvirt VIF driver configuration for the network
+    type: string
+  NovaPCIPassthrough:
+    description: >
+      List of PCI Passthrough whitelist parameters.
+      Example -
+      NovaPCIPassthrough:
+        - vendor_id: "8086"
+          product_id: "154c"
+          address: "0000:05:00.0"
+          physical_network: "datacentre"
+      For different formats, refer to the nova.conf documentation for
+      pci_passthrough_whitelist configuration
+    type: json
+    default: ''
+  NovaVcpuPinSet:
+    description: >
+      A list or range of physical CPU cores to reserve for virtual machine
+      processes.
+      Ex. NovaVcpuPinSet: ['4-12','^8'] will reserve cores from 4-12 excluding 8
+    type: comma_delimited_list
+    default: []
+    tags:
+      - role_specific
+  NovaReservedHostMemory:
+    description: >
+      Reserved RAM for host processes.
+    type: number
+    default: 4096
+    constraints:
+      - range: { min: 512 }
+    tags:
+      - role_specific
+  MonitoringSubscriptionNovaCompute:
+    default: 'overcloud-nova-compute'
+    type: string
+  NovaComputeLoggingSource:
+    type: json
+    default:
+      tag: openstack.nova.compute
+      path: /var/log/nova/nova-compute.log
+  UpgradeLevelNovaCompute:
+    type: string
+    description: Nova Compute upgrade level
+    default: ''
+  MigrationSshKey:
+    type: json
+    description: >
+      SSH key for migration.
+      Expects a dictionary with keys 'public_key' and 'private_key'.
+      Values should be identical to SSH public/private key files.
+    default:
+      public_key: ''
+      private_key: ''
+  MigrationSshPort:
+    default: 2022
+    description: Target port for migration over ssh
+    type: number
+  VerifyGlanceSignatures:
+    default: False
+    description: Whether to verify image signatures.
+    type: boolean
+
+conditions:
+  enable_live_migration_tunnelled:
+    or:
+      - equals: [{get_param: NovaNfsEnabled}, true]
+      - equals: [{get_param: NovaEnableRbdBackend}, true]
+
+resources:
+  NovaBase:
+    type: ./nova-base.yaml
+    properties:
+      ServiceData: {get_param: ServiceData}
+      ServiceNetMap: {get_param: ServiceNetMap}
+      DefaultPasswords: {get_param: DefaultPasswords}
+      EndpointMap: {get_param: EndpointMap}
+      RoleName: {get_param: RoleName}
+      RoleParameters: {get_param: RoleParameters}
+
+  # Merging role-specific parameters (RoleParameters) with the default parameters.
+  # RoleParameters will have the precedence over the default parameters.
+  RoleParametersValue:
+    type: OS::Heat::Value
+    properties:
+      type: json
+      value:
+        map_replace:
+          - map_replace:
+            - nova::compute::vcpu_pin_set: NovaVcpuPinSet
+              nova::compute::reserved_host_memory: NovaReservedHostMemory
+            - values: {get_param: [RoleParameters]}
+          - values:
+              NovaVcpuPinSet: {get_param: NovaVcpuPinSet}
+              NovaReservedHostMemory: {get_param: NovaReservedHostMemory}
+
+outputs:
+  role_data:
+    description: Role data for the Nova Compute service.
+    value:
+      service_name: nova_compute
+      monitoring_subscription: {get_param: MonitoringSubscriptionNovaCompute}
+      config_settings:
+        map_merge:
+          - get_attr: [NovaBase, role_data, config_settings]
+          - get_attr: [RoleParametersValue, value]
+          - nova::compute::libvirt::manage_libvirt_services: false
+            nova::compute::pci::passthrough:
+              str_replace:
+                template: "JSON_PARAM"
+                params:
+                  map_replace:
+                    - map_replace:
+                      - JSON_PARAM: NovaPCIPassthrough
+                      - values: {get_param: [RoleParameters]}
+                    - values:
+                        NovaPCIPassthrough: {get_param: NovaPCIPassthrough}
+            # we manage migration in nova common puppet profile
+            nova::compute::libvirt::migration_support: false
+            tripleo::profile::base::nova::migration::client::nova_compute_enabled: true
+            tripleo::profile::base::nova::migration::client::ssh_private_key: {get_param: [ MigrationSshKey, private_key ]}
+            tripleo::profile::base::nova::migration::client::ssh_port: {get_param: MigrationSshPort}
+            nova::compute::rbd::libvirt_images_rbd_ceph_conf:
+              list_join:
+              - ''
+              - - '/etc/ceph/'
+                - {get_param: CephClusterName}
+                - '.conf'
+            nova::compute::rbd::libvirt_images_rbd_pool: {get_param: NovaRbdPoolName}
+            nova::compute::rbd::libvirt_rbd_user: {get_param: CephClientUserName}
+            nova::compute::rbd::rbd_keyring:
+              list_join:
+              - '.'
+              - - 'client'
+                - {get_param: CephClientUserName}
+            tripleo::profile::base::nova::compute::cinder_nfs_backend: {get_param: CinderEnableNfsBackend}
+            tripleo::profile::base::nova::compute::nova_nfs_enabled: {get_param: NovaNfsEnabled}
+            rbd_persistent_storage: {get_param: CinderEnableRbdBackend}
+            nova::compute::rbd::libvirt_rbd_secret_key: {get_param: CephClientKey}
+            nova::compute::rbd::libvirt_rbd_secret_uuid: {get_param: CephClusterFSID}
+            nova::compute::instance_usage_audit: true
+            nova::compute::instance_usage_audit_period: 'hour'
+            nova::compute::rbd::ephemeral_storage: {get_param: NovaEnableRbdBackend}
+            # TUNNELLED mode provides a security improvement for migration, but
+            # can't be used in combination with block migration. So we only enable it
+            # when shared storage is available (Ceph RDB is currently the only option).
+            # See https://bugzilla.redhat.com/show_bug.cgi?id=1301986#c12
+            # In future versions of QEMU (2.6, mostly), danpb's native
+            # encryption work will obsolete the need to use TUNNELLED transport
+            # mode.
+            nova::migration::live_migration_tunnelled:
+              if:
+              - enable_live_migration_tunnelled
+              - true
+              - false
+            nova::compute::neutron::libvirt_vif_driver: {get_param: NovaComputeLibvirtVifDriver}
+            # NOTE: bind IP is found in Heat replacing the network name with the
+            # local node IP for the given network; replacement examples
+            # (eg. for internal_api):
+            # internal_api -> IP
+            # internal_api_uri -> [IP]
+            # internal_api_subnet - > IP/CIDR
+            nova::compute::vncserver_proxyclient_address: {get_param: [ServiceNetMap, NovaVncProxyNetwork]}
+            nova::compute::vncproxy_host: {get_param: [EndpointMap, NovaPublic, host_nobrackets]}
+            nova::vncproxy::common::vncproxy_protocol: {get_param: [EndpointMap, NovaVNCProxyPublic, protocol]}
+            nova::vncproxy::common::vncproxy_host: {get_param: [EndpointMap, NovaVNCProxyPublic, host_nobrackets]}
+            nova::vncproxy::common::vncproxy_port: {get_param: [EndpointMap, NovaVNCProxyPublic, port]}
+            nova::compute::verify_glance_signatures: {get_param: [VerifyGlanceSignatures]}
+      step_config: |
+        # TODO(emilien): figure how to deal with libvirt profile.
+        # We'll probably treat it like we do with Neutron plugins.
+        # Until then, just include it in the default nova-compute role.
+        include tripleo::profile::base::nova::compute::libvirt
+      service_config_settings:
+        fluentd:
+          tripleo_fluentd_groups_nova_compute:
+            - nova
+          tripleo_fluentd_sources_nova_compute:
+            - {get_param: NovaComputeLoggingSource}
+        collectd:
+          tripleo.collectd.plugins.nova_compute:
+            - virt
+          collectd::plugin::virt::connection: 'qemu:///system'
+      host_prep_tasks:
+        - name: Mount Nova NFS Share
+          vars:
+            nfs_backend_enable: {get_param: NovaNfsEnabled}
+            nfs_share: {get_param: NovaNfsShare}
+            nfs_options: {get_param: NovaNfsOptions}
+          mount: name=/var/lib/nova/instances src="{{nfs_share}}" fstype=nfs4 opts="_netdev,bg,{{nfs_options}},vers=4,nfsvers=4" state=mounted
+          when: nfs_backend_enable|bool
+      upgrade_tasks:
+        - name: Stop nova-compute service
+          when: step|int == 1
+          service: name=openstack-nova-compute state=stopped
+        # If not already set by puppet (e.g a pre-ocata version), set the
+        # upgrade_level for compute to "auto"
+        - name: Set compute upgrade level to auto
+          when: step|int == 3
+          ini_file:
+            str_replace:
+              template: "dest=/etc/nova/nova.conf section=upgrade_levels option=compute value=LEVEL"
+              params:
+                LEVEL: {get_param: UpgradeLevelNovaCompute}
+        - name: install openstack-nova-migration
+          when: step|int == 3
+          yum: name=openstack-nova-migration state=latest
+        - name: Start nova-compute service
+          when: step|int == 6
+          service: name=openstack-nova-compute state=started

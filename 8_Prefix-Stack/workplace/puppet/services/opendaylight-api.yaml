@@ -1,0 +1,203 @@
+heat_template_version: queens
+
+description: >
+  OpenDaylight SDN Controller.
+
+parameters:
+  OpenDaylightPort:
+    default: 0
+    description: Set opendaylight service port
+    type: number
+  OpenDaylightUsername:
+    default: 'admin'
+    description: The username for the opendaylight server.
+    type: string
+  OpenDaylightPassword:
+    type: string
+    description: The password for the opendaylight server.
+    hidden: true
+  OpenDaylightConnectionProtocol:
+    description: L7 protocol used for REST access
+    type: string
+    default: 'http'
+  OpenDaylightFeatures:
+    description: List of features to install with ODL
+    type: comma_delimited_list
+    default: ["odl-netvirt-openstack","odl-jolokia"]
+  OpenDaylightApiVirtualIP:
+    type: string
+    default: ''
+  EndpointMap:
+    default: {}
+    description: Mapping of service endpoint -> protocol. Typically set
+                 via parameter_defaults in the resource registry.
+    type: json
+  ServiceData:
+    default: {}
+    description: Dictionary packing service data
+    type: json
+  ServiceNetMap:
+    default: {}
+    description: Mapping of service_name -> network name. Typically set
+                 via parameter_defaults in the resource registry.  This
+                 mapping overrides those in ServiceNetMapDefaults.
+    type: json
+  DefaultPasswords:
+    default: {}
+    type: json
+  RoleName:
+    default: ''
+    description: Role name on which the service is applied
+    type: string
+  RoleParameters:
+    default: {}
+    description: Parameters specific to the role
+    type: json
+  OpenDaylightManageRepositories:
+    description: Whether to manage the OpenDaylight repository
+    type: boolean
+    default: false
+  OpenDaylightSNATMechanism:
+    description: SNAT mechanism to be used
+    default: 'conntrack'
+    type: string
+    constraints:
+      - allowed_values:
+          - conntrack
+          - controller
+  OpenDaylightLogMechanism:
+    description: Logging mechanism to be used
+    default: 'file'
+    type: string
+    constraints:
+      - allowed_values:
+          - file
+          - console
+  OpenDaylightTLSKeystorePassword:
+    default: 'opendaylight'
+    type: string
+    description: The password for the opendaylight TLS keystore.
+                 Must be at least 6 characters.
+    hidden: true
+  EnableInternalTLS:
+    type: boolean
+    default: false
+  InternalTLSCAFile:
+    default: '/etc/ipa/ca.crt'
+    type: string
+    description: Specifies the default CA cert to use if TLS is used for
+                 services in the internal network.
+
+parameter_groups:
+- label: deprecated
+  description: |
+   The following parameters are deprecated and will be removed. They should not
+   be relied on for new deployments. If you have concerns regarding deprecated
+   parameters, please contact the TripleO development team on IRC or the
+   OpenStack mailing list.
+  parameters:
+    - OpenDaylightConnectionProtocol
+    - OpenDaylightPort
+
+conditions:
+
+  internal_tls_enabled: {equals: [{get_param: EnableInternalTLS}, true]}
+  odl_deprecated_port_set:
+    not:
+      equals:
+        - {get_param: OpenDaylightPort}
+        - 0
+
+outputs:
+  role_data:
+    description: Role data for the OpenDaylight service.
+    value:
+      service_name: opendaylight_api
+      config_settings:
+        map_merge:
+          -
+            opendaylight::odl_rest_port:
+              if:
+                - odl_deprecated_port_set
+                - {get_param: OpenDaylightPort}
+                - {get_param: [EndpointMap, OpenDaylightInternal, port]}
+            opendaylight::username: {get_param: OpenDaylightUsername}
+            opendaylight::password: {get_param: OpenDaylightPassword}
+            opendaylight::extra_features: {get_param: OpenDaylightFeatures}
+            opendaylight::odl_bind_ip: {get_param: [ServiceNetMap, OpendaylightApiNetwork]}
+            opendaylight::manage_repositories: {get_param: OpenDaylightManageRepositories}
+            tripleo.opendaylight_api.firewall_rules:
+              '137 opendaylight api':
+                dport:
+                  - if:
+                      - odl_deprecated_port_set
+                      - {get_param: OpenDaylightPort}
+                      - {get_param: [EndpointMap, OpenDaylightInternal, port]}
+                  - 6640
+                  - 6653
+                  - 2550
+                  - 8185
+            opendaylight::snat_mechanism: {get_param: OpenDaylightSNATMechanism}
+            opendaylight::log_mechanism: {get_param: OpenDaylightLogMechanism}
+          -
+            if:
+              - internal_tls_enabled
+              - generate_service_certificates: true
+                tripleo::profile::base::neutron::opendaylight::certificate_specs:
+                  service_certificate: '/etc/pki/tls/certs/odl.crt'
+                  service_key: '/etc/pki/tls/private/odl.key'
+                  hostname:
+                    str_replace:
+                      template: "%{hiera('fqdn_NETWORK')}"
+                      params:
+                        NETWORK: {get_param: [ServiceNetMap, OpendaylightApiNetwork]}
+                  principal:
+                    str_replace:
+                      template: "odl/%{hiera('fqdn_NETWORK')}"
+                      params:
+                        NETWORK: {get_param: [ServiceNetMap, OpendaylightApiNetwork]}
+                opendaylight::tls_ca_cert_file: {get_param: InternalTLSCAFile}
+                opendaylight::tls_keystore_password: {get_param: OpenDaylightTLSKeystorePassword}
+              - {}
+      service_config_settings:
+        neutron_dhcp:
+          if:
+            - internal_tls_enabled
+            - neutron::agents::dhcp::ovsdb_connection: 'ssl:127.0.0.1:6639'
+            - neutron::agents::dhcp::ovsdb_connection: 'tcp:127.0.0.1:6639'
+      step_config: |
+        include tripleo::profile::base::neutron::opendaylight
+      upgrade_tasks:
+        - name: Check if opendaylight is deployed
+          command: systemctl is-enabled opendaylight
+          tags: common
+          ignore_errors: True
+          register: opendaylight_enabled
+        - name: "PreUpgrade step0,validation: Check service opendaylight is running"
+          shell: /usr/bin/systemctl show 'opendaylight' --property ActiveState | grep '\bactive\b'
+          when:
+            - step|int == 0
+            - opendaylight_enabled.rc == 0
+          tags: validation
+        - name: Stop opendaylight service
+          when:
+            - step|int == 1
+            - opendaylight_enabled.rc == 0
+          service: name=opendaylight state=stopped
+        - name: Removes ODL snapshots, data, journal directories
+          file:
+            state: absent
+            path: /opt/opendaylight/{{item}}
+          when: step|int == 2
+          with_items:
+            - snapshots
+            - data
+            - journal
+      metadata_settings:
+        if:
+          - internal_tls_enabled
+          -
+            - service: odl
+              network: {get_param: [ServiceNetMap, OpendaylightApiNetwork]}
+              type: node
+          - null

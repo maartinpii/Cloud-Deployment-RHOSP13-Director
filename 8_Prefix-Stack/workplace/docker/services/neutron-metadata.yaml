@@ -1,0 +1,164 @@
+heat_template_version: queens
+
+description: >
+  OpenStack containerized Neutron Metadata agent
+
+parameters:
+  DockerNeutronMetadataImage:
+    description: image
+    type: string
+  DockerNeutronConfigImage:
+    description: The container image to use for the neutron config_volume
+    type: string
+  ServiceData:
+    default: {}
+    description: Dictionary packing service data
+    type: json
+  ServiceNetMap:
+    default: {}
+    description: Mapping of service_name -> network name. Typically set
+                 via parameter_defaults in the resource registry.  This
+                 mapping overrides those in ServiceNetMapDefaults.
+    type: json
+  DefaultPasswords:
+    default: {}
+    type: json
+  EndpointMap:
+    default: {}
+    description: Mapping of service endpoint -> protocol. Typically set
+                 via parameter_defaults in the resource registry.
+    type: json
+  RoleName:
+    default: ''
+    description: Role name on which the service is applied
+    type: string
+  RoleParameters:
+    default: {}
+    description: Parameters specific to the role
+    type: json
+
+resources:
+
+  ContainersCommon:
+    type: ./containers-common.yaml
+
+  NeutronMetadataBase:
+    type: ../../puppet/services/neutron-metadata.yaml
+    properties:
+      EndpointMap: {get_param: EndpointMap}
+      ServiceData: {get_param: ServiceData}
+      ServiceNetMap: {get_param: ServiceNetMap}
+      DefaultPasswords: {get_param: DefaultPasswords}
+      RoleName: {get_param: RoleName}
+      RoleParameters: {get_param: RoleParameters}
+
+  NeutronLogging:
+    type: OS::TripleO::Services::Logging::NeutronCommon
+    properties:
+      NeutronServiceName: metadata-agent
+
+outputs:
+  role_data:
+    description: Role data for Neutron Metadata agent
+    value:
+      service_name: {get_attr: [NeutronMetadataBase, role_data, service_name]}
+      config_settings:
+        map_merge:
+          - get_attr: [NeutronMetadataBase, role_data, config_settings]
+          - get_attr: [NeutronLogging, config_settings]
+      logging_source: {get_attr: [NeutronMetadataBase, role_data, logging_source]}
+      logging_groups: {get_attr: [NeutronMetadataBase, role_data, logging_groups]}
+      service_config_settings: {get_attr: [NeutronMetadataBase, role_data, service_config_settings]}
+      puppet_config:
+        puppet_tags: neutron_config,neutron_metadata_agent_config
+        config_volume: neutron
+        step_config:
+          get_attr: [NeutronMetadataBase, role_data, step_config]
+        config_image: {get_param: DockerNeutronConfigImage}
+      kolla_config:
+        /var/lib/kolla/config_files/neutron_metadata_agent.json:
+          command:
+            list_join:
+              - ' '
+              - - /usr/bin/neutron-metadata-agent --config-file /usr/share/neutron/neutron-dist.conf --config-file /etc/neutron/neutron.conf --config-file /etc/neutron/metadata_agent.ini --config-dir /etc/neutron/conf.d/common --config-dir /etc/neutron/conf.d/neutron-metadata-agent
+                - get_attr: [NeutronLogging, cmd_extra_args]
+          config_files:
+            - source: "/var/lib/kolla/config_files/src/*"
+              dest: "/"
+              merge: true
+              preserve_properties: true
+          permissions:
+            - path: /var/log/neutron
+              owner: neutron:neutron
+              recurse: true
+            - path: /var/lib/neutron
+              owner: neutron:neutron
+              recurse: true
+      docker_config:
+        step_4:
+          neutron_metadata_agent:
+            start_order: 10
+            image: {get_param: DockerNeutronMetadataImage}
+            net: host
+            pid: host
+            privileged: true
+            restart: always
+            healthcheck:
+              test: /openstack/healthcheck
+            volumes:
+              list_concat:
+                - {get_attr: [ContainersCommon, volumes]}
+                - {get_attr: [NeutronLogging, volumes]}
+                -
+                  - /var/lib/kolla/config_files/neutron_metadata_agent.json:/var/lib/kolla/config_files/config.json:ro
+                  - /var/lib/config-data/puppet-generated/neutron/:/var/lib/kolla/config_files/src:ro
+                  - /lib/modules:/lib/modules:ro
+                  - /var/lib/neutron:/var/lib/neutron
+            environment:
+              - KOLLA_CONFIG_STRATEGY=COPY_ALWAYS
+      metadata_settings:
+        get_attr: [NeutronMetadataBase, role_data, metadata_settings]
+      host_prep_tasks:
+        list_concat:
+          - {get_attr: [NeutronLogging, host_prep_tasks]}
+          - - name: create /var/lib/neutron
+              file:
+                path: /var/lib/neutron
+                state: directory
+      upgrade_tasks:
+        - name: Check if neutron_metadata_agent is deployed
+          command: systemctl is-enabled --quiet neutron-metadata-agent
+          tags: common
+          ignore_errors: True
+          register: neutron_metadata_agent_enabled
+        - name: "PreUpgrade step0,validation: Check service neutron-metadata-agent is running"
+          command: systemctl is-active --quiet neutron-metadata-agent
+          when:
+            - step|int == 0
+            - neutron_metadata_agent_enabled.rc == 0
+          tags: validation
+        - name: Stop and disable neutron_metadata service
+          when:
+            - step|int == 2
+            - neutron_metadata_agent_enabled.rc == 0
+          service: name=neutron-metadata-agent state=stopped enabled=no
+      fast_forward_upgrade_tasks:
+        - name: Check if neutron_metadata_agent is deployed
+          command: systemctl is-enabled --quiet neutron-metadata-agent
+          ignore_errors: True
+          register: neutron_metadata_agent_enabled_result
+          when:
+            - step|int == 0
+            - release == 'ocata'
+        - name: Set fact neutron_metadata_agent_enabled
+          set_fact:
+            neutron_metadata_agent_enabled: "{{ neutron_metadata_agent_enabled_result.rc == 0 }}"
+          when:
+            - step|int == 0
+            - release == 'ocata'
+        - name: Stop neutron_metadata_agent
+          service: name=neutron-metadata-agent state=stopped enabled=no
+          when:
+            - step|int == 1
+            - release == 'ocata'
+            - neutron_metadata_agent_enabled|bool

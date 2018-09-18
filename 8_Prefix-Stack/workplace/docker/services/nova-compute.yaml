@@ -1,0 +1,323 @@
+heat_template_version: queens
+
+description: >
+  OpenStack containerized Nova Compute service
+
+parameters:
+  DockerNovaComputeImage:
+    description: image
+    type: string
+  DockerNovaLibvirtConfigImage:
+    description: The container image to use for the nova_libvirt config_volume
+    type: string
+  DockerNovaComputeUlimit:
+    default: ['nofile=1024']
+    description: ulimit for Nova Compute Container
+    type: comma_delimited_list
+  ServiceData:
+    default: {}
+    description: Dictionary packing service data
+    type: json
+  ServiceNetMap:
+    default: {}
+    description: Mapping of service_name -> network name. Typically set
+                 via parameter_defaults in the resource registry.  This
+                 mapping overrides those in ServiceNetMapDefaults.
+    type: json
+  DefaultPasswords:
+    default: {}
+    type: json
+  RoleName:
+    default: ''
+    description: Role name on which the service is applied
+    type: string
+  RoleParameters:
+    default: {}
+    description: Parameters specific to the role
+    type: json
+  EndpointMap:
+    default: {}
+    description: Mapping of service endpoint -> protocol. Typically set
+                 via parameter_defaults in the resource registry.
+    type: json
+  DockerNovaMigrationSshdPort:
+    default: 2022
+    description: Port that dockerized nova migration target sshd service
+                 binds to.
+    type: number
+  UpgradeLevelNovaCompute:
+    type: string
+    description: Nova Compute upgrade level
+    default: ''
+  UpgradeRemoveUnusedPackages:
+    default: false
+    description: Remove package if the service is being disabled during upgrade
+    type: boolean
+  CephClientUserName:
+    default: openstack
+    type: string
+  CephClusterName:
+    type: string
+    default: ceph
+    description: The Ceph cluster name.
+    constraints:
+    - allowed_pattern: "[a-zA-Z0-9]+"
+      description: >
+        The Ceph cluster name must be at least 1 character and contain only
+        letters and numbers.
+  NovaComputeOptVolumes:
+    default: []
+    description: list of optional vo
+    type: comma_delimited_list
+  NovaComputeOptEnvVars:
+    default: []
+    description: list of optional en
+    type: comma_delimited_list
+  EnableInstanceHA:
+    default: false
+    description: Whether to enable an Instance Ha configurarion or not.
+                 This setup requires the Compute role to have the
+                 PacemakerRemote service added to it.
+    type: boolean
+
+resources:
+
+  ContainersCommon:
+    type: ./containers-common.yaml
+
+  MySQLClient:
+    type: ../../puppet/services/database/mysql-client.yaml
+
+  NovaComputeCommon:
+    type: ./nova-compute-common.yaml
+    properties:
+      EndpointMap: {get_param: EndpointMap}
+      ServiceData: {get_param: ServiceData}
+      ServiceNetMap: {get_param: ServiceNetMap}
+      DefaultPasswords: {get_param: DefaultPasswords}
+      RoleName: {get_param: RoleName}
+      RoleParameters: {get_param: RoleParameters}
+
+  NovaComputeBase:
+    type: ../../puppet/services/nova-compute.yaml
+    properties:
+      EndpointMap: {get_param: EndpointMap}
+      ServiceData: {get_param: ServiceData}
+      ServiceNetMap: {get_param: ServiceNetMap}
+      DefaultPasswords: {get_param: DefaultPasswords}
+      RoleName: {get_param: RoleName}
+      RoleParameters: {get_param: RoleParameters}
+
+  NovaLogging:
+    type: OS::TripleO::Services::Logging::NovaCommon
+    properties:
+      DockerNovaImage: {get_param: DockerNovaComputeImage}
+      NovaServiceName: 'compute'
+
+conditions:
+  enable_instance_ha: {equals: [{get_param: EnableInstanceHA}, true]}
+
+outputs:
+  role_data:
+    description: Role data for the Nova Compute service.
+    value:
+      service_name: {get_attr: [NovaComputeBase, role_data, service_name]}
+      cellv2_discovery: true
+      config_settings:
+        map_merge:
+          - get_attr: [NovaComputeBase, role_data, config_settings]
+          - get_attr: [NovaLogging, config_settings]
+      logging_source: {get_attr: [NovaComputeBase, role_data, logging_source]}
+      logging_groups: {get_attr: [NovaComputeBase, role_data, logging_groups]}
+      service_config_settings: {get_attr: [NovaComputeBase, role_data, service_config_settings]}
+      puppet_config:
+        config_volume: nova_libvirt
+        puppet_tags: nova_config,nova_paste_api_ini
+        step_config:
+          list_join:
+            - "\n"
+            - - {get_attr: [NovaComputeBase, role_data, step_config]}
+              - {get_attr: [MySQLClient, role_data, step_config]}
+        config_image: {get_param: DockerNovaLibvirtConfigImage}
+      kolla_config:
+        /var/lib/kolla/config_files/nova_compute.json:
+          command:
+            list_join:
+            - ' '
+            - - if:
+                - enable_instance_ha
+                - /var/lib/nova/instanceha/check-run-nova-compute
+                - /usr/bin/nova-compute
+              - get_attr: [NovaLogging, cmd_extra_args]
+          config_files:
+            - source: "/var/lib/kolla/config_files/src/*"
+              dest: "/"
+              merge: true
+              preserve_properties: true
+            - source: "/var/lib/kolla/config_files/src-iscsid/*"
+              dest: "/etc/iscsi/"
+              merge: true
+              preserve_properties: true
+            - source: "/var/lib/kolla/config_files/src-ceph/"
+              dest: "/etc/ceph/"
+              merge: true
+              preserve_properties: true
+          permissions:
+            - path: /var/log/nova
+              owner: nova:nova
+              recurse: true
+            - path:
+                str_replace:
+                  template: /etc/ceph/CLUSTER.client.USER.keyring
+                  params:
+                    CLUSTER: {get_param: CephClusterName}
+                    USER: {get_param: CephClientUserName}
+              owner: nova:nova
+              perm: '0600'
+      docker_config_scripts: {get_attr: [NovaComputeCommon, docker_config_scripts]}
+      docker_config:
+        step_3:
+          nova_statedir_owner:
+            image: &nova_compute_image {get_param: DockerNovaComputeImage}
+            user: root
+            privileged: false
+            detach: false
+            volumes:
+              - /var/lib/nova:/var/lib/nova:shared
+              - /var/lib/docker-config-scripts/:/docker-config-scripts/
+            command: "/docker-config-scripts/nova_statedir_ownership.py"
+        step_4:
+          nova_compute:
+            image: *nova_compute_image
+            ulimit: {get_param: DockerNovaComputeUlimit}
+            ipc: host
+            net: host
+            privileged: true
+            user: nova
+            restart: always
+            healthcheck:
+              test: /openstack/healthcheck
+            volumes:
+              list_concat:
+                - {get_attr: [ContainersCommon, volumes]}
+                - {get_attr: [NovaLogging, volumes]}
+                - {get_param: NovaComputeOptVolumes}
+                -
+                  - /var/lib/kolla/config_files/nova_compute.json:/var/lib/kolla/config_files/config.json:ro
+                  - /var/lib/config-data/puppet-generated/nova_libvirt/:/var/lib/kolla/config_files/src:ro
+                  - /etc/iscsi:/var/lib/kolla/config_files/src-iscsid:ro
+                  - /etc/ceph:/var/lib/kolla/config_files/src-ceph:ro
+                  - /dev:/dev
+                  - /lib/modules:/lib/modules:ro
+                  - /run:/run
+                  - /var/lib/nova:/var/lib/nova:shared
+                  - /var/lib/libvirt:/var/lib/libvirt
+                  - /sys/class/net:/sys/class/net
+                  - /sys/bus/pci:/sys/bus/pci
+            environment:
+              list_concat:
+                - {get_param: NovaComputeOptEnvVars}
+                -
+                  - KOLLA_CONFIG_STRATEGY=COPY_ALWAYS
+      host_prep_tasks:
+        list_concat:
+        - {get_attr: [NovaLogging, host_prep_tasks]}
+        - {get_attr: [NovaComputeBase, role_data, host_prep_tasks]}
+        - - name: create persistent directories
+            file:
+              path: "{{ item }}"
+              state: directory
+            with_items:
+              - /var/lib/nova
+              - /var/lib/nova/instances
+              - /var/lib/libvirt
+          - name: ensure ceph configurations exist
+            file:
+              path: /etc/ceph
+              state: directory
+          - name: is Instance HA enabled
+            set_fact:
+              instance_ha_enabled: {get_param: EnableInstanceHA}
+          - name: install Instance HA recovery script
+            when: instance_ha_enabled|bool
+            block:
+            - name: prepare Instance HA script directory
+              file:
+                path: /var/lib/nova/instanceha
+                state: directory
+            - name: install Instance HA script that runs nova-compute
+              copy:
+                content: {get_file: ../../extraconfig/tasks/instanceha/check-run-nova-compute}
+                dest: /var/lib/nova/instanceha/check-run-nova-compute
+                mode: 0755
+            - name: Get list of instance HA compute nodes
+              command: hiera -c /etc/puppet/hiera.yaml compute_instanceha_short_node_names
+              register: iha_nodes
+            - name: If instance HA is enabled on the node activate the evacuation completed check
+              file: path=/var/lib/nova/instanceha/enabled state=touch
+              when: iha_nodes.stdout|lower | search('"'+ansible_hostname|lower+'"')
+      upgrade_tasks:
+        - name: Check if nova_compute is deployed
+          command: systemctl is-enabled --quiet openstack-nova-compute
+          tags: common
+          ignore_errors: True
+          register: nova_compute_enabled
+        - name: Set compute upgrade level to auto
+          when: step|int == 1
+          ini_file:
+            str_replace:
+              template: "dest=/etc/nova/nova.conf section=upgrade_levels option=compute value=LEVEL"
+              params:
+                LEVEL: {get_param: UpgradeLevelNovaCompute}
+        - name: "PreUpgrade step0,validation: Check service openstack-nova-compute is running"
+          command: systemctl is-active --quiet openstack-nova-compute
+          tags: validation
+          when:
+            - step|int == 0
+            - nova_compute_enabled.rc == 0
+        - name: Stop and disable nova-compute service
+          when:
+            - step|int == 2
+            - nova_compute_enabled.rc == 0
+          service: name=openstack-nova-compute state=stopped enabled=no
+        - name: Set upgrade marker in nova statedir
+          when: 
+            - step|int == 2
+            - nova_compute_enabled|bool
+          file: path=/var/lib/nova/upgrade_marker state=touch owner=nova group=nova
+        - name: Set fact for removal of openstack-nova-compute package
+          when: step|int == 2
+          set_fact:
+            remove_nova_compute_package: {get_param: UpgradeRemoveUnusedPackages}
+        - name: Remove openstack-nova-compute package if operator requests it
+          yum: name=openstack-nova-compute state=removed
+          ignore_errors: True
+          when:
+            - step|int == 2
+            - remove_nova_compute_package|bool
+      fast_forward_upgrade_tasks:
+        - name: Check if nova-compute is deployed
+          command:  systemctl is-enabled --quiet openstack-nova-compute
+          ignore_errors: True
+          register: nova_compute_enabled_result
+          when:
+            - step|int == 0
+            - release == 'ocata'
+        - name: Set fact nova_compute_enabled
+          set_fact:
+            nova_compute_enabled: "{{ nova_compute_enabled_result.rc == 0 }}"
+          when:
+            - step|int == 0
+            - release == 'ocata'
+        - name: Stop and disable nova-compute service
+          service: name=openstack-nova-compute state=stopped
+          when:
+            - step|int == 1
+            - nova_compute_enabled|bool
+            - release == 'ocata'
+        - name: Set upgrade marker in nova statedir
+          when:
+            - step|int == 1
+            - nova_compute_enabled|bool
+            - release == 'ocata'
+          file: path=/var/lib/nova/upgrade_marker state=touch owner=nova group=nova

@@ -1,0 +1,45 @@
+heat_template_version: queens
+
+description: >
+  OpenStack containerized Glance API service
+
+parameters:
+  DockerGlanceApiImage:
+    description: image
+    type: string
+
+outputs:
+  config_settings:
+    description: Extra hieradata needed to log to files in the host.
+    value: null
+  volumes:
+    description: The volumes needed to log to files in the host.
+    value: &glance_api_volumes
+      - /var/log/containers/glance:/var/log/glance
+  docker_config:
+    description: Extra containers needed for logging to files in the host.
+    value:
+      # Kolla_bootstrap/db_sync runs before permissions set by kolla_config
+      step_2:
+        glance_init_logs:
+          image: {get_param: DockerGlanceApiImage}
+          privileged: false
+          user: root
+          volumes: *glance_api_volumes
+          command: ['/bin/bash', '-c', 'chown -R glance:glance /var/log/glance']
+  host_prep_tasks:
+    description: Extra ansible tasks needed for logging to files in the host.
+    value:
+      - name: create persistent logs directory
+        file:
+          path: "{{ item }}"
+          state: directory
+        with_items:
+          - /var/log/containers/glance
+      - name: glance logs readme
+        copy:
+          dest: /var/log/glance/readme.txt
+          content: |
+            Log files from glance containers can be found under
+            /var/log/containers/glance.
+        ignore_errors: true

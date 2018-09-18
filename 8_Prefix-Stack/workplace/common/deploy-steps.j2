@@ -1,0 +1,705 @@
+# certain initialization steps (run in a container) will occur
+# on the role marked as primary controller or the first role listed
+{%- if enabled_roles is not defined or enabled_roles == [] -%}
+  # On upgrade certain roles can be disabled for operator driven upgrades
+  # See major_upgrade_steps.j2.yaml and post-upgrade.j2.yaml
+  {%- set enabled_roles = roles -%}
+  {%- set is_upgrade = false -%}
+{%- else %}
+  {%- set is_upgrade = true -%}
+{%- endif -%}
+{%- set primary_role = [enabled_roles[0]] -%}
+{%- for role in enabled_roles -%}
+  {%- if 'primary' in role.tags and 'controller' in role.tags -%}
+    {%- set _ = primary_role.pop() -%}
+    {%- set _ = primary_role.append(role) -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set primary_role_name = primary_role[0].name -%}
+# primary role is: {{primary_role_name}}
+{% set deploy_steps_max = 6 -%}
+{% set update_steps_max = 6 -%}
+{% set pre_upgrade_rolling_steps_max = 1 -%}
+{% set upgrade_steps_max = 6 -%}
+{% set post_upgrade_steps_max = 4 -%}
+{% set fast_forward_upgrade_steps_max = 9 -%}
+{% set fast_forward_upgrade_prep_steps_max = 3 -%}
+{% set post_update_steps_max = 4 -%}
+
+heat_template_version: queens
+
+description: >
+  Post-deploy configuration steps via puppet for all roles,
+  as defined in ../roles_data.yaml
+
+parameters:
+  servers:
+    type: json
+    description: Mapping of Role name e.g Controller to a list of servers
+  stack_name:
+    type: string
+    description: Name of the topmost stack
+  role_data:
+    type: json
+    description: Mapping of Role name e.g Controller to the per-role data
+  DeployIdentifier:
+    default: ''
+    type: string
+    description: >
+      Setting this to a unique value will re-run any deployment tasks which
+      perform configuration on a Heat stack-update.
+  EndpointMap:
+    default: {}
+    description: Mapping of service endpoint -> protocol. Typically set
+                 via parameter_defaults in the resource registry.
+    type: json
+  ConfigDebug:
+    default: false
+    description: Whether to run config management (e.g. Puppet) in debug mode.
+    type: boolean
+  DockerPuppetDebug:
+    type: string
+    default: ''
+    description: Set to True to enable debug logging with docker-puppet.py
+  DockerPuppetProcessCount:
+    type: number
+    default: 3
+    description: Number of concurrent processes to use when running docker-puppet to generate config files.
+  ctlplane_service_ips:
+    type: json
+  blacklisted_ip_addresses:
+    description: List of IP addresses belong to blacklisted servers
+    type: comma_delimited_list
+    default: []
+  blacklisted_hostnames:
+    description: List of hostnames belong to blacklisted servers
+    type: comma_delimited_list
+    default: []
+  FastForwardUpgradeReleases:
+    type: comma_delimited_list
+    default: ['ocata', 'pike', 'queens']
+    description: List of releases to fast forward through during upgrade. Last release in list is used for post steps.
+  ssh_known_hosts_hostnames:
+    description: Mapping of hostname to ssh known hosts entry
+    type: json
+
+conditions:
+{% for step in range(1, deploy_steps_max) %}
+  WorkflowTasks_Step{{step}}_Enabled:
+    or:
+    {%- for role in enabled_roles %}
+      - not:
+          equals:
+            - get_param: [role_data, {{role.name}}, workflow_tasks, step{{step}}]
+            - ''
+      - False
+    {%- endfor %}
+{% endfor %}
+
+resources:
+
+  RoleConfig:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: ansible
+      options:
+        modulepath: /usr/share/ansible-modules
+      inputs:
+        - name: step
+        - name: role_name
+        - name: update_identifier
+        - name: bootstrap_server_id
+        - name: enable_debug
+        - name: docker_puppet_debug
+        - name: docker_puppet_process_count
+        - name: role_data_step_config
+        - name: role_data_puppet_config
+          type: Json
+        - name: role_data_docker_config_scripts
+          type: Json
+        - name: role_data_docker_puppet_tasks
+          type: Json
+        - name: role_data_docker_config
+          type: Json
+        - name: role_data_kolla_config
+          type: Json
+
+      config:
+        str_replace:
+          template: |
+            - hosts: localhost
+              connection: local
+              tasks:
+              _TASKS
+          params:
+            _TASKS: {get_file: deploy-steps-tasks.yaml}
+
+  ExternalDeployTasks:
+    type: OS::Heat::Value
+    properties:
+      type: comma_delimited_list
+      value:
+        yaql:
+          # processing from per-role unique tasks into globally unique tasks
+          expression: coalesce($.data, []).flatten().distinct()
+          data:
+          {%- for role in enabled_roles %}
+            - get_param: [role_data, {{role.name}}, external_deploy_tasks]
+          {%- endfor %}
+
+  ExternalPostDeployTasks:
+    type: OS::Heat::Value
+    properties:
+      type: comma_delimited_list
+      value:
+        yaql:
+          # processing from per-role unique tasks into globally unique tasks
+          expression: coalesce($.data, []).flatten().distinct()
+          data:
+          {%- for role in enabled_roles %}
+            - get_param: [role_data, {{role.name}}, external_post_deploy_tasks]
+          {%- endfor %}
+
+{%- for step in range(1, deploy_steps_max) %}
+# BEGIN workflow_tasks handling
+  WorkflowTasks_Step{{step}}:
+    type: OS::Mistral::Workflow
+    condition: WorkflowTasks_Step{{step}}_Enabled
+    depends_on:
+    {%- if step == 1 %}
+    {%- for dep in enabled_roles %}
+      - {{dep.name}}PreConfig
+      - {{dep.name}}ArtifactsDeploy
+    {%- endfor %}
+    {%- else %}
+    {%- for dep in enabled_roles %}
+      - {{dep.name}}Deployment_Step{{step -1}}
+    {%- endfor %}
+    {%- endif %}
+    properties:
+      name: {list_join: [".", ["tripleo", {get_param: stack_name}, "workflow_tasks", "step{{step}}"]]}
+      type: direct
+      tags:
+      - tripleo-heat-templates-managed
+      - {get_param: stack_name}
+      tasks:
+        yaql:
+          expression: $.data.where($ != '').select($.get('step{{step}}')).where($ != null).flatten()
+          data:
+          {%- for role in enabled_roles %}
+            - get_param: [role_data, {{role.name}}, workflow_tasks]
+          {%- endfor %}
+
+  WorkflowTasks_Step{{step}}_Execution:
+    type: OS::TripleO::WorkflowSteps
+    condition: WorkflowTasks_Step{{step}}_Enabled
+    depends_on: WorkflowTasks_Step{{step}}
+    properties:
+      actions:
+        CREATE:
+          workflow: { get_resource: WorkflowTasks_Step{{step}} }
+          params:
+            env:
+              heat_stack_name: { get_param: stack_name }
+              service_ips: { get_param: ctlplane_service_ips }
+              role_merged_configs:
+                {%- for r in roles %}
+                {{r.name}}: {get_param: [role_data, {{r.name}}, merged_config_settings]}
+                {%- endfor %}
+              blacklisted_ip_addresses: {get_param: blacklisted_ip_addresses}
+              blacklisted_hostnames: {get_param: blacklisted_hostnames}
+            evaluate_env: false
+        UPDATE:
+          workflow: { get_resource: WorkflowTasks_Step{{step}} }
+          params:
+            env:
+              heat_stack_name: { get_param: stack_name }
+              service_ips: { get_param: ctlplane_service_ips }
+              role_merged_configs:
+                {%- for r in roles %}
+                {{r.name}}: {get_param: [role_data, {{r.name}}, merged_config_settings]}
+                {%- endfor %}
+              blacklisted_ip_addresses: {get_param: blacklisted_ip_addresses}
+              blacklisted_hostnames: {get_param: blacklisted_hostnames}
+            evaluate_env: false
+      always_update: true
+# END workflow_tasks handling
+{% endfor %}
+
+  BootstrapServerId:
+    type: OS::Heat::Value
+    properties:
+      value:
+        yaql:
+          expression: $.data.items().orderBy($[0]).first()[1]
+          data: {get_param: [servers, {{primary_role_name}}]}
+
+# Artifacts config and HostPrepConfig is done on all roles, not only
+# enabled_roles, because on upgrade we need to write the json files
+# for the operator driven upgrade scripts (the ansible steps consume them)
+{% for role in roles %}
+  # Prepare host tasks for {{role.name}}
+  {{role.name}}ArtifactsConfig:
+    type: ../puppet/deploy-artifacts.yaml
+
+  {{role.name}}ArtifactsDeploy:
+    type: OS::Heat::StructuredDeploymentGroup
+    properties:
+      name: {{role.name}}ArtifactsDeploy
+      servers:  {get_param: [servers, {{role.name}}]}
+      config: {get_resource: {{role.name}}ArtifactsConfig}
+
+  {{role.name}}HostPrepConfig:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: ansible
+      options:
+        modulepath: /usr/share/ansible-modules
+      config:
+        str_replace:
+          template: _PLAYBOOK
+          params:
+            _PLAYBOOK:
+              - hosts: localhost
+                connection: local
+                vars:
+                  docker_puppet_script: {get_file: ../docker/docker-puppet.py}
+                  bootstrap_server_id: {get_attr: [BootstrapServerId, value]}
+                tasks:
+                  # Join host_prep_tasks with the other per-host configuration
+                  list_concat:
+{%- if is_upgrade|default(false) and role.disable_upgrade_deployment|default(false) %}
+                    - []
+{%- else %}
+                    - {get_param: [role_data, {{role.name}}, host_prep_tasks]}
+{%- endif %}
+                    -
+                      # FIXME: can we move docker-puppet somewhere so it's installed via a package?
+                      - name: Create /var/lib/docker-puppet
+                        file: path=/var/lib/docker-puppet state=directory setype=svirt_sandbox_file_t selevel=s0 recurse=true
+                      - name: Write docker-puppet.py
+                        copy: content="{{ '{{' }}docker_puppet_script{{ '}}' }}" dest=/var/lib/docker-puppet/docker-puppet.py force=yes mode=0600
+
+  {{role.name}}HostPrepDeployment:
+    type: OS::Heat::SoftwareDeploymentGroup
+    properties:
+      name: {{role.name}}HostPrepDeployment
+      servers: {get_param: [servers, {{role.name}}]}
+      config: {get_resource: {{role.name}}HostPrepConfig}
+{% endfor %}
+
+  # BEGIN CONFIG STEPS, only on enabled_roles
+{%- for role in enabled_roles %}
+  {{role.name}}PreConfig:
+    type: OS::TripleO::Tasks::{{role.name}}PreConfig
+    depends_on: {{role.name}}HostPrepDeployment
+    properties:
+      servers: {get_param: [servers, {{role.name}}]}
+      input_values:
+        update_identifier: {get_param: DeployIdentifier}
+
+  # Deployment steps for {{role.name}}
+  # A single config is re-applied with an incrementing step number
+  {% for step in range(1, deploy_steps_max) %}
+  {{role.name}}Deployment_Step{{step}}:
+    type: OS::TripleO::DeploymentSteps
+    depends_on:
+      - WorkflowTasks_Step{{step}}_Execution
+    # TODO(gfidente): the following if/else condition
+    # replicates what is already defined for the
+    # WorkflowTasks_StepX resource and can be remove
+    # if https://bugs.launchpad.net/heat/+bug/1700569
+    # is fixed.
+    {%- if step == 1 %}
+    {%- for dep in enabled_roles %}
+      - {{dep.name}}PreConfig
+      - {{dep.name}}ArtifactsDeploy
+    {%- endfor %}
+    {%- else %}
+    {%- for dep in enabled_roles %}
+      - {{dep.name}}Deployment_Step{{step -1}}
+    {%- endfor %}
+    {%- endif %}
+    properties:
+      name: {{role.name}}Deployment_Step{{step}}
+      servers: {get_param: [servers, {{role.name}}]}
+      config: {get_resource: RoleConfig}
+      input_values:
+        step: {{step}}
+        role_name: {{role.name}}
+        update_identifier: {get_param: DeployIdentifier}
+        bootstrap_server_id: {get_attr: [BootstrapServerId, value]}
+        enable_debug: {get_param: ConfigDebug}
+        docker_puppet_debug: {get_param: DockerPuppetDebug}
+        docker_puppet_process_count: {get_param: DockerPuppetProcessCount}
+        role_data_step_config: {get_param: [role_data, {{role.name}}, step_config]}
+        role_data_puppet_config: {get_param: [role_data, {{role.name}}, puppet_config]}
+        role_data_docker_config_scripts: {get_param: [role_data, {{role.name}}, docker_config_scripts]}
+        role_data_docker_puppet_tasks: {get_param: [role_data, {{role.name}}, docker_puppet_tasks]}
+        role_data_docker_config: {get_param: [role_data, {{role.name}}, docker_config]}
+        role_data_kolla_config: {get_param: [role_data, {{role.name}}, kolla_config]}
+        deploy_steps_max: {{deploy_steps_max}}
+
+  {% endfor %}
+  # END CONFIG STEPS
+
+  # Note, this should be the last step to execute configuration changes.
+  # Ensure that all {{role.name}}ExtraConfigPost steps are executed
+  # after all the previous deployment steps.
+  {{role.name}}ExtraConfigPost:
+    depends_on:
+  {%- for dep in enabled_roles %}
+      - {{dep.name}}Deployment_Step{{deploy_steps_max - 1}}
+  {%- endfor %}
+    type: OS::TripleO::NodeExtraConfigPost
+    properties:
+        servers: {get_param: [servers, {{role.name}}]}
+
+  # The {{role.name}}PostConfig steps are in charge of
+  # quiescing all services, i.e. in the Controller case,
+  # we should run a full service reload.
+  {{role.name}}PostConfig:
+    type: OS::TripleO::Tasks::{{role.name}}PostConfig
+    depends_on:
+  {%- for dep in enabled_roles %}
+      - {{dep.name}}ExtraConfigPost
+  {%- endfor %}
+    properties:
+      servers:  {get_param: servers}
+      input_values:
+        update_identifier: {get_param: DeployIdentifier}
+
+
+{% endfor %}
+
+outputs:
+  RoleConfig:
+    description: Mapping of config data for all roles
+    value:
+      global_vars:
+        deploy_steps_max: {{deploy_steps_max}}
+        ssh_known_hosts: {get_param: ssh_known_hosts_hostnames}
+      common_deploy_steps_tasks: {get_file: deploy-steps-tasks.yaml}
+      docker_puppet_script: {get_file: ../docker/docker-puppet.py}
+      deploy_steps_playbook:
+        str_replace:
+          params:
+            BOOTSTRAP_SERVER_ID: {get_attr: [BootstrapServerId, value]}
+          template: |
+            - hosts: undercloud
+              name: Gather facts undercloud
+              gather_facts: yes
+              become: false
+              tags:
+                - facts
+
+            - hosts: overcloud
+              name: Gather facts overcloud
+              gather_facts: yes
+              tags:
+                - facts
+
+            - hosts: all
+              name: Load global variables
+              gather_facts: no
+              tasks:
+                - include_vars: global_vars.yaml
+              tags:
+                - always
+
+            - hosts: overcloud
+              name: Common roles for TripleO servers
+              gather_facts: no
+              any_errors_fatal: yes
+              roles:
+                - tripleo-bootstrap
+                - tripleo-ssh-known-hosts
+              tags:
+                - common_roles
+
+            - hosts: {{primary_role_name}}:overcloud
+              name: Server deployments
+              gather_facts: no
+              any_errors_fatal: yes
+              tasks:
+{%- for role in roles %}
+                - include: {{role.name}}/deployments.yaml
+                  vars:
+                    force: false
+                  when: role_name == '{{role.name}}'
+                  with_items: "{{ '{{' }} {{role.name}}_pre_deployments|default([]) {{ '}}' }}"
+{%- endfor %}
+              tags:
+                - overcloud
+                - pre_deploy_steps
+
+            - hosts: {{primary_role_name}}:overcloud
+              name: Host prep steps
+              gather_facts: no
+              any_errors_fatal: yes
+              vars:
+                bootstrap_server_id: BOOTSTRAP_SERVER_ID
+              become: true
+              tasks:
+{%- for role in roles %}
+                - include: {{role.name}}/host_prep_tasks.yaml
+                  when: role_name == '{{role.name}}'
+{%- endfor %}
+              tags:
+                - overcloud
+                - host_prep_steps
+
+{%- for step in range(1,deploy_steps_max) %}
+
+            - hosts: undercloud
+              name: External deployment step {{step}}
+              gather_facts: no
+              any_errors_fatal: yes
+              become: false
+              vars:
+                step: '{{step}}'
+              tasks:
+                - include: external_deploy_steps_tasks.yaml
+              tags:
+                - external
+                - external_deploy_steps
+
+            - hosts: {{primary_role_name}}:overcloud
+              name: Overcloud deploy step tasks for {{step}}
+              gather_facts: no
+              any_errors_fatal: yes
+              # FIXME(shardy) - it would be nice to use strategy: free to
+              # allow the tasks per-step to run in parallel on each role,
+              # but that doesn't work with any_errors_fatal: yes
+              vars:
+                bootstrap_server_id: BOOTSTRAP_SERVER_ID
+                step: '{{step}}'
+              tasks:
+{%- for role in roles %}
+                - include: {{role.name}}/deploy_steps_tasks.yaml
+                  when: role_name == '{{role.name}}'
+{%- endfor %}
+              tags:
+                - overcloud
+                - deploy_steps
+
+            - hosts: {{primary_role_name}}:overcloud
+              name: Overcloud common deploy step tasks {{step}}
+              gather_facts: no
+              any_errors_fatal: yes
+              vars:
+                bootstrap_server_id: BOOTSTRAP_SERVER_ID
+                step: '{{step}}'
+              tasks:
+                - include: common_deploy_steps_tasks.yaml
+              tags:
+                - overcloud
+                - deploy_steps
+
+{%- endfor %}
+            - hosts: {{primary_role_name}}:overcloud
+              name: Server Post Deployments
+              gather_facts: no
+              any_errors_fatal: yes
+              tasks:
+{%- for role in roles %}
+                - include: {{role.name}}/deployments.yaml
+                  vars:
+                    force: false
+                  when: role_name == '{{role.name}}'
+                  with_items: "{{ '{{' }} {{role.name}}_post_deployments|default([]) {{ '}}' }}"
+{%- endfor %}
+              tags:
+                - overcloud
+                - post_deploy_steps
+
+            - hosts: undercloud
+              name: External deployment Post Deploy tasks
+              gather_facts: no
+              any_errors_fatal: yes
+              become: false
+              tasks:
+                - include: external_post_deploy_steps_tasks.yaml
+              tags:
+                - external
+                - external_deploy_steps
+
+      external_deploy_steps_tasks: {get_attr: [ExternalDeployTasks, value]}
+      external_post_deploy_steps_tasks: {get_attr: [ExternalPostDeployTasks, value]}
+      update_steps_tasks: |
+{%- for role in roles %}
+            - include: {{role.name}}/update_tasks.yaml
+              when: role_name == '{{role.name}}'
+{%- endfor %}
+      update_steps_playbook: |
+        - hosts: undercloud
+          name: Gather facts undercloud
+          gather_facts: yes
+          become: false
+        - hosts: overcloud
+          name: Gather facts overcloud
+          gather_facts: yes
+        - hosts: all
+          name: Load global variables
+          gather_facts: no
+          tasks:
+            - include_vars: global_vars.yaml
+        - hosts: overcloud
+          name: Run update
+          serial: 1
+          gather_facts: no
+          tasks:
+            - include: update_steps_tasks.yaml
+              with_sequence: start=0 end={{update_steps_max-1}}
+              loop_control:
+                loop_var: step
+{%- for role in roles %}
+            - include: {{role.name}}/host_prep_tasks.yaml
+              when: role_name == '{{role.name}}'
+{%- endfor %}
+            - include: common_deploy_steps_tasks.yaml
+              with_sequence: start=1 end={{deploy_steps_max-1}}
+              loop_control:
+                loop_var: step
+            - include: post_update_steps_tasks.yaml
+              with_sequence: start=0 end={{post_update_steps_max-1}}
+              loop_control:
+                loop_var: step
+      pre_upgrade_rolling_steps_tasks: |
+{%- for role in roles %}
+            - include: {{role.name}}/pre_upgrade_rolling_tasks.yaml
+              when: role_name == '{{role.name}}'
+{%- endfor %}
+      pre_upgrade_rolling_steps_playbook: |
+        - hosts: undercloud
+          name: Gather facts undercloud
+          gather_facts: yes
+          become: false
+        - hosts: overcloud
+          name: Gather facts overcloud
+          gather_facts: yes
+        - hosts: all
+          name: Load global variables
+          gather_facts: no
+          tasks:
+            - include_vars: global_vars.yaml
+        - hosts: overcloud
+          name: Run pre-upgrade rolling tasks
+          serial: 1
+          gather_facts: no
+          tasks:
+            - include: pre_upgrade_rolling_steps_tasks.yaml
+              with_sequence: start=0 end={{pre_upgrade_rolling_steps_max-1}}
+              loop_control:
+                loop_var: step
+      upgrade_steps_tasks: |
+{%- for role in roles %}
+            - include: {{role.name}}/upgrade_tasks.yaml
+              when: role_name == '{{role.name}}'
+{%- endfor %}
+      upgrade_steps_playbook: |
+        - hosts: overcloud
+          tasks:
+            - include: upgrade_steps_tasks.yaml
+              with_sequence: start=0 end={{upgrade_steps_max-1}}
+              loop_control:
+                loop_var: step
+      post_upgrade_steps_tasks: |
+{%- for role in roles %}
+            - include: {{role.name}}/post_upgrade_tasks.yaml
+              when: role_name == '{{role.name}}'
+{%- endfor %}
+      post_upgrade_steps_playbook: |
+        - hosts: overcloud
+          tasks:
+            - include: post_upgrade_steps_tasks.yaml
+              with_sequence: start=0 end={{post_upgrade_steps_max-1}}
+              loop_control:
+                loop_var: step
+      fast_forward_upgrade_playbook:
+        - hosts: overcloud
+          become: true
+          tasks:
+            - set_fact:
+                releases: {get_param: [FastForwardUpgradeReleases]}
+{% raw %}
+            - set_fact:
+                ffu_releases: "{{ releases | difference( releases | last )}}"
+            - include_tasks: fast_forward_upgrade_release_tasks.yaml
+              loop_control:
+                loop_var: release
+              with_items: '{{ ffu_releases }}'
+            - set_fact:
+                release: "{{ releases | last }}"
+                ffu_packages_apply: True
+{% endraw %}
+            - include_tasks: fast_forward_upgrade_post_role_tasks.yaml
+      fast_forward_upgrade_release_tasks: |
+                - include_tasks: fast_forward_upgrade_prep_tasks.yaml
+                - include_tasks: fast_forward_upgrade_bootstrap_tasks.yaml
+      fast_forward_upgrade_prep_tasks: |
+{%- for role in roles %}
+                - shell: |
+                    #!/bin/bash
+                    if [ ! -f /root/.ffu_workaround ]; then
+                      touch /root/.ffu_workaround
+                      os-apply-config -m /var/lib/os-collect-config/{{role.deprecated_server_resource_name|default(role.name)}}Deployment.json
+                      systemctl stop os-collect-config
+                      rm -r /var/lib/os-collect-config/*
+                      rm -f /usr/libexec/os-refresh-config/configure.d/40-hiera-datafiles
+                      rm -f /usr/libexec/os-apply-config/templates/etc/puppet/hiera.yaml
+                      rm -f /usr/libexec/os-refresh-config/configure.d/10-hiera-disable
+                    fi
+                  when: role_name == '{{role.name}}'
+                  name: Run Fast Forward Upgrade Prep Workarounds for {{role.name}}
+{%- endfor %}
+{% raw %}
+                - name: get bootstrap nodeid
+                  tags: common
+                  command: hiera -c /etc/puppet/hiera.yaml bootstrap_nodeid
+                  register: bootstrap_node
+                - name: set is_bootstrap_node ffu_packages_bootstrap_only facts
+                  tags: common
+                  set_fact:
+                    is_bootstrap_node={{bootstrap_node.stdout|lower == ansible_hostname|lower}}
+                    ffu_packages_apply={{bootstrap_node.stdout|lower == ansible_hostname|lower}}
+{% endraw %}
+                - name: Create /var/lib/docker-puppet
+                  file: path=/var/lib/docker-puppet state=directory setype=svirt_sandbox_file_t selevel=s0 recurse=true
+                - name: Write docker-puppet.py
+                  copy: src=docker_puppet_script.yaml dest=/var/lib/docker-puppet/docker-puppet.py force=yes mode=0600
+                - include_tasks: fast_forward_upgrade_prep_role_tasks.yaml
+                  with_sequence: start=0 end={{fast_forward_upgrade_prep_steps_max}}
+                  loop_control:
+                    loop_var: step
+      fast_forward_upgrade_post_role_tasks: |
+{%- for role in roles %}
+                - include_tasks: {{role.name}}/fast_forward_post_upgrade_tasks.yaml
+                  when: role_name == '{{role.name}}'
+{%- endfor %}
+                - name: Openstack Heat Agents package update
+                  yum: name=openstack-heat-agents state=latest
+                - name: Update os-collect-config
+                  yum: name=os-collect-config state=latest
+                - name: Start os-collect-config back up
+                  service: name=os-collect-config state=started enabled=yes
+      fast_forward_upgrade_prep_role_tasks: |
+{%- for role in roles %}
+                - include_tasks: {{role.name}}/fast_forward_upgrade_tasks.yaml
+                  when: role_name == '{{role.name}}'
+{%- endfor %}
+      fast_forward_upgrade_bootstrap_tasks: |
+                - include_tasks: fast_forward_upgrade_bootstrap_role_tasks.yaml
+                  with_sequence: start={{fast_forward_upgrade_prep_steps_max+1}} end={{fast_forward_upgrade_steps_max}}
+                  loop_control:
+                    loop_var: step
+      fast_forward_upgrade_bootstrap_role_tasks: |
+{%- for role in roles %}
+                - include_tasks: {{role.name}}/fast_forward_upgrade_tasks.yaml
+                  when: role_name == '{{role.name}}' and ansible_hostname == {{role.name}}[0]
+{%- endfor %}
+      post_update_steps_tasks: |
+{%- for role in roles %}
+            - include: {{role.name}}/post_update_tasks.yaml
+              when: role_name == '{{role.name}}'
+{%- endfor %}

@@ -1,0 +1,75 @@
+heat_template_version: queens
+
+description: >
+  Openstack Heat CloudWatch API service, disabled by default since Pike
+
+parameters:
+  ServiceData:
+    default: {}
+    description: Dictionary packing service data
+    type: json
+  ServiceNetMap:
+    default: {}
+    description: Mapping of service_name -> network name. Typically set
+                 via parameter_defaults in the resource registry.  This
+                 mapping overrides those in ServiceNetMapDefaults.
+    type: json
+  DefaultPasswords:
+    default: {}
+    type: json
+  RoleName:
+    default: ''
+    description: Role name on which the service is applied
+    type: string
+  RoleParameters:
+    default: {}
+    description: Parameters specific to the role
+    type: json
+  EndpointMap:
+    default: {}
+    description: Mapping of service endpoint -> protocol. Typically set
+                 via parameter_defaults in the resource registry.
+    type: json
+
+outputs:
+  role_data:
+    description: Role data for the disabled Heat CloudWatch API
+    value:
+      service_name:  heat_api_cloudwatch_disabled
+      upgrade_tasks:
+        - name: Check if heat_api_cloudwatch is deployed
+          command: systemctl is-enabled openstack-heat-api-cloudwatch
+          when: step|int == 1
+          ignore_errors: True
+          register: heat_api_cloudwatch_enabled
+        - name: Stop and disable heat_api_cloudwatch service (pre-upgrade not under httpd)
+          when:
+            - step|int == 1
+            - heat_api_cloudwatch_enabled.rc == 0
+          service: name=openstack-heat-api-cloudwatch state=stopped enabled=no
+      fast_forward_upgrade_tasks:
+        - name: FFU check if heat_api_cloudwatch is deployed
+          command: systemctl is-enabled openstack-heat-api-cloudwatch
+          ignore_errors: True
+          register: heat_api_cloudwatch_enabled_result
+          when:
+            - step|int == 0
+            - release == 'ocata'
+        - name: Set fact heat_api_cloudwatch_enabled
+          set_fact:
+            heat_api_cloudwatch_enabled: "{{ heat_api_cloudwatch_enabled_result.rc == 0 }}"
+          when:
+            - step|int == 0
+            - release == 'ocata'
+        - name: FFU stop and disable the heat-api-cloudwatch service.
+          service: name=openstack-heat-api-cloudwatch state=stopped enabled=no
+          when:
+            - step|int == 1
+            - release == 'ocata'
+            - heat_api_cloudwatch_enabled|bool
+        - name: Remove heat_api_cloudwatch package
+          yum: name=openstack-heat-api-cloudwatch state=removed
+          ignore_errors: True
+          when:
+            - step|int == 2
+            - release == 'ocata'

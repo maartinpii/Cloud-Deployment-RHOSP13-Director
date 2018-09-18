@@ -1,0 +1,228 @@
+heat_template_version: queens
+
+description: >
+  OpenStack containerized Nova Vncproxy service
+
+parameters:
+  DockerNovaVncProxyImage:
+    description: image
+    type: string
+  DockerNovaConfigImage:
+    description: The container image to use for the nova config_volume
+    type: string
+  EndpointMap:
+    default: {}
+    description: Mapping of service endpoint -> protocol. Typically set
+                 via parameter_defaults in the resource registry.
+    type: json
+  ServiceData:
+    default: {}
+    description: Dictionary packing service data
+    type: json
+  ServiceNetMap:
+    default: {}
+    description: Mapping of service_name -> network name. Typically set
+                 via parameter_defaults in the resource registry.  This
+                 mapping overrides those in ServiceNetMapDefaults.
+    type: json
+  DefaultPasswords:
+    default: {}
+    type: json
+  RoleName:
+    default: ''
+    description: Role name on which the service is applied
+    type: string
+  RoleParameters:
+    default: {}
+    description: Parameters specific to the role
+    type: json
+  UpgradeRemoveUnusedPackages:
+    default: false
+    description: Remove package if the service is being disabled during upgrade
+    type: boolean
+  EnableInternalTLS:
+    type: boolean
+    default: false
+  UseTLSTransportForVnc:
+    type: boolean
+    default: true
+    description: If set to true and if EnableInternalTLS is enabled, it will
+                 enable TLS transaport for libvirt VNC and configure the
+                 relevant keys for libvirt.
+  InternalTLSVncCAFile:
+    default: '/etc/pki/CA/certs/vnc.crt'
+    type: string
+    description: Specifies the CA cert to use for VNC TLS.
+  LibvirtVncCACert:
+    type: string
+    default: ''
+    description: This specifies the CA certificate to use for VNC TLS.
+                 This file will be symlinked to the default CA path,
+                 which is /etc/pki/libvirt-vnc/ca-cert.pem.
+                 This parameter should be used if the default (which comes from
+                 the InternalTLSVncCAFile parameter) is not desired. The current
+                 default reflects TripleO's default CA, which is FreeIPA.
+                 It will only be used if internal TLS is enabled.
+
+
+conditions:
+
+  use_tls_for_vnc:
+    and:
+    - equals:
+      - {get_param: EnableInternalTLS}
+      - true
+    - equals:
+      - {get_param: UseTLSTransportForVnc}
+      - true
+
+  libvirt_vnc_specific_ca_unset:
+    equals:
+      - {get_param: LibvirtVncCACert}
+      - ''
+
+resources:
+
+  ContainersCommon:
+    type: ./containers-common.yaml
+
+  MySQLClient:
+    type: ../../puppet/services/database/mysql-client.yaml
+
+  NovaVncProxyPuppetBase:
+    type: ../../puppet/services/nova-vnc-proxy.yaml
+    properties:
+      EndpointMap: {get_param: EndpointMap}
+      ServiceData: {get_param: ServiceData}
+      ServiceNetMap: {get_param: ServiceNetMap}
+      DefaultPasswords: {get_param: DefaultPasswords}
+      RoleName: {get_param: RoleName}
+      RoleParameters: {get_param: RoleParameters}
+
+  NovaLogging:
+    type: OS::TripleO::Services::Logging::NovaCommon
+    properties:
+      DockerNovaImage: {get_param: DockerNovaVncProxyImage}
+      NovaServiceName: 'vncproxy'
+
+outputs:
+  role_data:
+    description: Role data for the Nova Vncproxy service.
+    value:
+      service_name: {get_attr: [NovaVncProxyPuppetBase, role_data, service_name]}
+      config_settings:
+        map_merge:
+          - {get_attr: [NovaVncProxyPuppetBase, role_data, config_settings]}
+          - {get_attr: [NovaLogging, config_settings]}
+      logging_source: {get_attr: [NovaVncProxyPuppetBase, role_data, logging_source]}
+      logging_groups: {get_attr: [NovaVncProxyPuppetBase, role_data, logging_groups]}
+      service_config_settings: {get_attr: [NovaVncProxyPuppetBase, role_data, service_config_settings]}
+      # BEGIN DOCKER SETTINGS
+      puppet_config:
+        config_volume: nova
+        puppet_tags: nova_config
+        step_config:
+          list_join:
+            - "\n"
+            - - {get_attr: [NovaVncProxyPuppetBase, role_data, step_config]}
+              - {get_attr: [MySQLClient, role_data, step_config]}
+        config_image: {get_param: DockerNovaConfigImage}
+      kolla_config:
+        /var/lib/kolla/config_files/nova_vnc_proxy.json:
+          command:
+            list_join:
+            - ' '
+            - - /usr/bin/nova-novncproxy --web /usr/share/novnc/
+              - get_attr: [NovaLogging, cmd_extra_args]
+          config_files:
+            - source: "/var/lib/kolla/config_files/src/*"
+              dest: "/"
+              merge: true
+              preserve_properties: true
+          permissions:
+            - path: /var/log/nova
+              owner: nova:nova
+              recurse: true
+      docker_config:
+        step_4:
+          nova_vnc_proxy:
+            image: {get_param: DockerNovaVncProxyImage}
+            net: host
+            privileged: false
+            restart: always
+            healthcheck:
+              test: /openstack/healthcheck
+            volumes:
+              list_concat:
+                - {get_attr: [ContainersCommon, volumes]}
+                - {get_attr: [NovaLogging, volumes]}
+                -
+                  - /var/lib/kolla/config_files/nova_vnc_proxy.json:/var/lib/kolla/config_files/config.json:ro
+                  - /var/lib/config-data/puppet-generated/nova/:/var/lib/kolla/config_files/src:ro
+                -
+                  if:
+                    - use_tls_for_vnc
+                    -
+                      - str_replace:
+                          template: "CACERT:/etc/pki/libvirt-vnc/ca-cert.pem:ro"
+                          params:
+                            CACERT:
+                              if:
+                                - libvirt_vnc_specific_ca_unset
+                                - get_param: InternalTLSVncCAFile
+                                - get_param: LibvirtVncCACert
+                      - /etc/pki/libvirt-vnc/client-cert.pem:/etc/pki/libvirt-vnc/client-cert.pem:ro
+                      - /etc/pki/libvirt-vnc/client-key.pem:/etc/pki/libvirt-vnc/client-key.pem:ro
+                    - null
+            environment:
+              - KOLLA_CONFIG_STRATEGY=COPY_ALWAYS
+      metadata_settings:
+        get_attr: [NovaVncProxyPuppetBase, role_data, metadata_settings]
+      host_prep_tasks: {get_attr: [NovaLogging, host_prep_tasks]}
+      upgrade_tasks:
+        - name: Check if nova vncproxy is deployed
+          command: systemctl is-enabled --quiet openstack-nova-novncproxy
+          tags: common
+          ignore_errors: True
+          register: nova_vncproxy_enabled
+        - name: "PreUpgrade step0,validation: Check service openstack-nova-novncproxy is running"
+          command: systemctl is-active --quiet openstack-nova-novncproxy
+          tags: validation
+          when:
+            - step|int == 0
+            - nova_vncproxy_enabled.rc == 0
+        - name: Stop and disable nova_vnc_proxy service
+          when:
+            - step|int == 2
+            - nova_vncproxy_enabled.rc == 0
+          service: name=openstack-nova-novncproxy state=stopped enabled=no
+        - name: Set fact for removal of openstack-nova-novncproxy package
+          when: step|int == 2
+          set_fact:
+            remove_nova_novncproxy_package: {get_param: UpgradeRemoveUnusedPackages}
+        - name: Remove openstack-nova-novncproxy package if operator requests it
+          yum: name=openstack-nova-novncproxy state=removed
+          ignore_errors: True
+          when:
+            - step|int == 2
+            - remove_nova_novncproxy_package|bool
+      fast_forward_upgrade_tasks:
+        - name: Check if nova vncproxy is deployed
+          command: systemctl is-enabled --quiet openstack-nova-novncproxy
+          ignore_errors: True
+          register: nova_vncproxy_enabled_result
+          when:
+            - step|int == 0
+            - release == 'ocata'
+        - name: Set fact nova_vncproxy_enabled
+          set_fact:
+            nova_vncproxy_enabled: "{{ nova_vncproxy_enabled_result.rc == 0 }}"
+          when:
+            - step|int == 0
+            - release == 'ocata'
+        - name: Stop and disable nova-novncproxy service
+          service: name=openstack-nova-novncproxy state=stopped
+          when:
+            - step|int == 1
+            - release == 'ocata'
+            - nova_vncproxy_enabled|bool

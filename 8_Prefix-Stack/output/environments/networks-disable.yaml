@@ -1,0 +1,14 @@
+# Disable the creation of Neutron networks
+# This can be useful if you want to create two stacks along side of each
+# other. The first stack (doesn't use this environment) and creates
+# all of the Neutron networks. The second stack suppresses the
+# creation of Networks and shares the same network spaces.
+resource_registry:
+  OS::TripleO::Network::Storage: OS::Heat::None
+  OS::TripleO::Network::StorageMgmt: OS::Heat::None
+  OS::TripleO::Network::InternalApi: OS::Heat::None
+  OS::TripleO::Network::Tenant: OS::Heat::None
+  OS::TripleO::Network::External: OS::Heat::None
+  OS::TripleO::Network::Management: OS::Heat::None
+
+  #FIXME: probably also want to suppress creation of overcloud.yaml VIPs as well

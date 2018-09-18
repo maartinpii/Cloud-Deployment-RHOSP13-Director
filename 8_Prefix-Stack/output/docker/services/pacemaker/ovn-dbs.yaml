@@ -1,0 +1,339 @@
+heat_template_version: queens
+
+description: >
+  OpenStack containerized OVN DBs service managed by pacemaker
+
+parameters:
+  DockerOvnDbsImage:
+    description: image
+    type: string
+  DockerOvnDbsConfigImage:
+    description: image
+    type: string
+  EndpointMap:
+    default: {}
+    description: Mapping of service endpoint -> protocol. Typically set
+                 via parameter_defaults in the resource registry.
+    type: json
+  ServiceData:
+    default: {}
+    description: Dictionary packing service data
+    type: json
+  ServiceNetMap:
+    default: {}
+    description: Mapping of service_name -> network name. Typically set
+                 via parameter_defaults in the resource registry.  This
+                 mapping overrides those in ServiceNetMapDefaults.
+    type: json
+  DefaultPasswords:
+    default: {}
+    type: json
+  RoleName:
+    default: ''
+    description: Role name on which the service is applied
+    type: string
+  RoleParameters:
+    default: {}
+    description: Parameters specific to the role
+    type: json
+  OVNNorthboundServerPort:
+    description: Port of the OVN Northbound DB server
+    type: number
+    default: 6641
+  OVNSouthboundServerPort:
+    description: Port of the OVN Southbound DB server
+    type: number
+    default: 6642
+  ConfigDebug:
+    default: false
+    description: Whether to run config management (e.g. Puppet) in debug mode.
+    type: boolean
+  PcmkConfigRestartTimeout:
+    default: 600
+    description: Time in seconds to wait for a pcmk resource to restart when
+                 a config change is detected and the resource is being restarted
+    type: number
+  DeployIdentifier:
+    default: ''
+    type: string
+    description: >
+      Setting this to a unique value will re-run any deployment tasks which
+      perform configuration on a Heat stack-update.
+
+conditions:
+  puppet_debug_enabled: {get_param: ConfigDebug}
+
+resources:
+
+  ContainersCommon:
+    type: ./../containers-common.yaml
+
+  OVNDbsBase:
+    type: ../../../puppet/services/pacemaker/ovn-dbs.yaml
+    properties:
+      EndpointMap: {get_param: EndpointMap}
+      ServiceData: {get_param: ServiceData}
+      ServiceNetMap: {get_param: ServiceNetMap}
+      DefaultPasswords: {get_param: DefaultPasswords}
+      RoleName: {get_param: RoleName}
+      RoleParameters: {get_param: RoleParameters}
+      OVNNorthboundServerPort: {get_param: OVNNorthboundServerPort}
+      OVNSouthboundServerPort: {get_param: OVNSouthboundServerPort}
+
+outputs:
+  role_data:
+    description: Role data for the OVN Dbs HA role.
+    value:
+      service_name: {get_attr: [OVNDbsBase, role_data, service_name]}
+      config_settings:
+        map_merge:
+          - get_attr: [OVNDbsBase, role_data, config_settings]
+          - tripleo::profile::pacemaker::ovn_dbs_bundle::ovn_dbs_docker_image: &ovn_dbs_image_pcmklatest
+              list_join:
+                - ':'
+                - - yaql:
+                      data: {get_param: DockerOvnDbsImage}
+                      expression: $.data.rightSplit(separator => ":", maxSplits => 1)[0]
+                  - 'pcmklatest'
+          - tripleo::profile::pacemaker::ovn_dbs_bundle::nb_db_port: {get_param: OVNNorthboundServerPort}
+          - tripleo::profile::pacemaker::ovn_dbs_bundle::sb_db_port: {get_param: OVNSouthboundServerPort}
+      logging_source: {get_attr: [OVNDbsBase, role_data, logging_source]}
+      logging_groups: {get_attr: [OVNDbsBase, role_data, logging_groups]}
+      service_config_settings: {get_attr: [OVNDbsBase, role_data, service_config_settings]}
+      # BEGIN DOCKER SETTINGS
+      puppet_config:
+        config_volume: 'ovn_dbs'
+        puppet_tags: 'exec'
+        step_config: ''
+        config_image: &ovn_dbs_config_image {get_param: DockerOvnDbsConfigImage}
+      kolla_config:
+        /var/lib/kolla/config_files/ovn_dbs.json:
+          command: /usr/sbin/pacemaker_remoted
+          config_files:
+            - dest: /etc/libqb/force-filesystem-sockets
+              source: /dev/null
+              owner: root
+              perm: '0644'
+            - source: "/var/lib/kolla/config_files/src/*"
+              dest: "/"
+              merge: true
+              preserve_properties: true
+              optional: true
+      docker_config_scripts: {get_attr: [ContainersCommon, docker_config_scripts]}
+      docker_config:
+        step_2:
+          ovn_dbs_image_tag:
+            start_order: 0
+            detach: false
+            net: host
+            user: root
+            command:
+              - '/bin/bash'
+              - '-c'
+              - str_replace:
+                  template:
+                    "/usr/bin/docker tag 'OVN_DBS_IMAGE' 'OVN_DBS_IMAGE_PCMKLATEST'"
+                  params:
+                    OVN_DBS_IMAGE: {get_param: DockerOvnDbsImage}
+                    OVN_DBS_IMAGE_PCMKLATEST: *ovn_dbs_image_pcmklatest
+            image: {get_param: DockerOvnDbsImage}
+            volumes:
+              - /etc/hosts:/etc/hosts:ro
+              - /etc/localtime:/etc/localtime:ro
+              - /dev/shm:/dev/shm:rw
+              - /etc/sysconfig/docker:/etc/sysconfig/docker:ro
+              - /usr/bin:/usr/bin:ro
+              - /var/run/docker.sock:/var/run/docker.sock:rw
+        step_3:
+          ovn_dbs_restart_bundle:
+            start_order: 0
+            config_volume: ovn_dbs
+            detach: false
+            net: host
+            user: root
+            command:
+              - '/usr/bin/bootstrap_host_exec'
+              - 'ovn_dbs'
+              - str_replace:
+                  template:
+                    'if /usr/sbin/pcs resource show ovn-dbs-bundle; then /usr/sbin/pcs resource restart --wait=PCMKTIMEOUT ovn-dbs-bundle; echo "ovn-dbs-bundle restart invoked"; fi'
+                  params:
+                    PCMKTIMEOUT: {get_param: PcmkConfigRestartTimeout}
+            image: {get_param: DockerOvnDbsConfigImage}
+            volumes:
+              list_concat:
+                - {get_attr: [ContainersCommon, volumes]}
+                -
+                  - /etc/corosync/corosync.conf:/etc/corosync/corosync.conf:ro
+                  - /dev/shm:/dev/shm:rw
+                  - /var/lib/config-data/puppet-generated/ovn_dbs/:/var/lib/kolla/config_files/src:ro
+          ovn_dbs_init_bundle:
+            start_order: 1
+            detach: false
+            net: host
+            user: root
+            config_volume: 'ovn_dbs_init_bundle'
+            command: # '/docker_puppet_apply.sh "STEP" "TAGS" "CONFIG" "DEBUG"'
+              list_concat:
+                - - '/docker_puppet_apply.sh'
+                  - '3'
+                  - 'file,file_line,concat,augeas,pacemaker::resource::bundle,pacemaker::property,pacemaker::resource::ip,pacemaker::resource::ocf,pacemaker::constraint::order,pacemaker::constraint::colocation'
+                  - 'include ::tripleo::profile::base::pacemaker;include ::tripleo::profile::pacemaker::ovn_dbs_bundle'
+                - if:
+                  - puppet_debug_enabled
+                  - - '--debug'
+                  - - ''
+            image: *ovn_dbs_config_image
+            volumes:
+              list_concat:
+                - {get_attr: [ContainersCommon, docker_puppet_apply_volumes]}
+                - - /etc/corosync/corosync.conf:/etc/corosync/corosync.conf:ro
+                  - /dev/shm:/dev/shm:rw
+            environment:
+              # NOTE: this should force this container to re-run on each
+              # update (scale-out, etc.)
+              - list_join:
+                  - ''
+                  - - 'TRIPLEO_DEPLOY_IDENTIFIER='
+                    - {get_param: DeployIdentifier}
+      host_prep_tasks:
+        - name: create persistent directories
+          file:
+            path: "{{ item }}"
+            state: directory
+          with_items:
+            - /var/log/containers/openvswitch
+            - /var/lib/openvswitch/ovn
+        - name: openvswitch logs readme
+          copy:
+            dest: /var/log/openvswitch/readme.txt
+            content: |
+              Log files from openvswitch containers can be found under
+              /var/log/containers/openvswitch.
+          ignore_errors: true
+      update_tasks:
+        - name: Get docker ovn-dbs image
+          set_fact:
+            ovn_dbs_docker_image: {get_param: DockerOvnDbsImage}
+            ovn_dbs_docker_image_latest: *ovn_dbs_image_pcmklatest
+        - name: Check for ovn-dbs log file
+          stat:
+            path: /var/log/containers/openvswitch/ovsdb-server-nb.log
+          register: ovn_dbs_log_file
+        - name: Check if ovn-dbs is already containerized
+          set_fact:
+            ovn_dbs_containerized: "{{ovn_dbs_log_file.stat.exists | default(false)}}"
+        - name: get bootstrap nodeid
+          command: hiera -c /etc/puppet/hiera.yaml bootstrap_nodeid
+          register: bootstrap_node
+        - name: set is_bootstrap_node fact
+          set_fact: is_bootstrap_node={{bootstrap_node.stdout|lower == ansible_hostname|lower}}
+        - name: ovn-dbs fetch and retag container image for pacemaker
+          when:
+            - step|int == 3
+            - ovn_dbs_containerized|bool
+          block: &ovn_dbs_fetch_retag_container_tasks
+            - name: Get previous ovn-dbs image id
+              shell: "docker images | awk '/ovn.* pcmklatest/{print $3}' | uniq"
+              register: ovn_dbs_image_id
+            - block:
+                - name: Get a list of container using ovn-dbs image
+                  shell: "docker ps -a -q -f 'ancestor={{ovn_dbs_image_id.stdout}}'"
+                  register: ovn_dbs_containers_to_destroy
+                # It will be recreated with the deploy step.
+                - name: Remove any container using the same ovn-dbs image
+                  shell: "docker rm -fv {{item}}"
+                  with_items: "{{ ovn_dbs_containers_to_destroy.stdout_lines }}"
+                - name: Remove previous ovn-dbs images
+                  shell: "docker rmi -f {{ovn_dbs_image_id.stdout}}"
+              when:
+                - ovn_dbs_image_id.stdout != ''
+            - name: Pull latest ovn-dbs images
+              command: "docker pull {{ovn_dbs_docker_image}}"
+            - name: Retag pcmklatest to latest ovn-dbs image
+              shell: "docker tag {{ovn_dbs_docker_image}} {{ovn_dbs_docker_image_latest}}"
+            # Got to check that pacemaker_is_active is working fine with bundle.
+            # TODO: pacemaker_is_active resource doesn't support bundle.
+        # When ovn-dbs-bundle support was added, we didn't tag the ovn-dbs image
+        # with pcmklatest. So, when update is run for the first time we need to
+        # update the ovn-dbs-bundle resource to use the 'pcmklatest' tagged image.
+        # See  https://bugzilla.redhat.com/show_bug.cgi?id=1586132.
+        # Step 3 (see above) takes care of tagging the image.
+        - name: Update ovn-dbs-bundle resource to use pcmklatest tag image if not used
+          when:
+            - step|int == 5
+            - ovn_dbs_containerized|bool
+            - is_bootstrap_node
+          block:
+            - name: Get the present image used by ovn-dbs-bundle
+              shell: "pcs resource show ovn-dbs-bundle | grep image | awk '{ split($2, image, \"=\"); print image[2] }'"
+              register: ovn_dbs_current_image
+            - block: &ovn_dbs_update_bundle_with_new_image
+                - name: Update the ovn-dbs-bundle to use the new container image name
+                  command: "pcs resource bundle update ovn-dbs-bundle container image={{ovn_dbs_docker_image_latest}}"
+              when:
+                - ovn_dbs_current_image.stdout != ovn_dbs_docker_image_latest
+      upgrade_tasks:
+        - name: Stop and disable ovn-northd service
+          when: step|int == 1
+          service: name=ovn-northd state=stopped enabled=no
+          ignore_errors: true
+        - name: Check for ovn-dbs log file
+          stat:
+            path: /var/log/containers/openvswitch/ovsdb-server-nb.log
+          register: ovn_dbs_log_file
+        - name: Check if ovn-dbs is already containerized
+          set_fact:
+            ovn_dbs_containerized: "{{ovn_dbs_log_file.stat.exists | default(false)}}"
+        - name: Get docker ovn-dbs image
+          set_fact:
+            ovn_dbs_docker_image: {get_param: DockerOvnDbsImage}
+            ovn_dbs_docker_image_latest: *ovn_dbs_image_pcmklatest
+        - name: get bootstrap nodeid
+          command: hiera -c /etc/puppet/hiera.yaml bootstrap_nodeid
+          register: bootstrap_node
+        - name: set is_bootstrap_node fact
+          set_fact: is_bootstrap_node={{bootstrap_node.stdout|lower == ansible_hostname|lower}}
+        - name: Prepare the switch to new ovn-dbs container image name in pacemaker
+          when:
+            - step|int == 0
+            - ovn_dbs_containerized|bool
+          block:
+            - name: Get ovn-dbs image id currently used by pacemaker
+              shell: "docker images | awk '/ovn.* pcmklatest/{print $3}' | uniq"
+              register: ovn_dbs_current_pcmklatest_id
+            - name: Temporarily tag the current ovn-dbs pcmklatest image id with the upgraded image name
+              shell: "docker tag {{ovn_dbs_current_pcmklatest_id.stdout}} {{ovn_dbs_docker_image_latest}}"
+              when: ovn_dbs_current_pcmklatest_id.stdout != ''
+            # If ovn-dbs image is not tagged with pcmklatest, then create a new
+            # tag. This could happen if the stack is upgraded without updating the stack before.
+            # In the next step, the block 'ovn_dbs_update_bundle_with_new_image'
+            # will update the ovn-dbs-bundle resource to use the tagged image.
+            # And in step 3, we will fetch the latest image.
+            - block:
+                - name: Get the present image used by ovn-dbs-bundle
+                  shell: "pcs resource show ovn-dbs-bundle | grep image | awk '{ split($2, image, \"=\"); print image[2] }'"
+                  register: ovn_dbs_current_image
+                - name: Tag the current image with pcmklatest tag
+                  shell: "docker tag {{ovn_dbs_current_image.stdout}} {{ovn_dbs_docker_image_latest}}"
+              when:
+                - ovn_dbs_current_pcmklatest_id.stdout == ''
+        - name: Check ovn-dbs-bundle cluster resource status
+          pacemaker_resource:
+            resource: ovn-dbs-bundle
+            state: show
+            check_mode: false
+          ignore_errors: true
+          register: ovndbs_pcs_res
+        - name: Update ovn-bundle pcs resource bundle for new container image
+          when:
+            - step|int == 1
+            - ovn_dbs_containerized|bool
+            - is_bootstrap_node
+            - ovndbs_pcs_res|succeeded
+          block: *ovn_dbs_update_bundle_with_new_image
+        - name: Retag the pacemaker image if containerized
+          when:
+            - step|int == 3
+            - ovn_dbs_containerized|bool
+          block: *ovn_dbs_fetch_retag_container_tasks

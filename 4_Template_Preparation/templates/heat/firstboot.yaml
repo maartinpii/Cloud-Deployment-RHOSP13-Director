@@ -1,0 +1,22 @@
+heat_template_version: 2014-10-16
+
+description: >
+  Set root password
+
+resources:
+  userdata:
+    type: OS::Heat::MultipartMime
+    properties:
+      parts:
+      - config: {get_resource: set_pass}
+
+  set_pass:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      config: |
+        #!/bin/bash
+        echo 'r3dh4t1!' | passwd --stdin root
+
+outputs:
+  OS::stack_id:
+    value: {get_resource: userdata}

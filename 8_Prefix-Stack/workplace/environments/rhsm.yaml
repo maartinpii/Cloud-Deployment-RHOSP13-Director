@@ -1,0 +1,37 @@
+# A Heat environment file that enables RHSM.
+
+resource_registry:
+  OS::TripleO::Services::Rhsm: ../extraconfig/services/rhsm.yaml
+
+parameter_defaults:
+# RhsmVars:
+#   rhsm_repos:
+#     - rhel-7-server-rpms
+#     - rhel-7-server-extras-rpms
+#     - rhel-ha-for-rhel-7-server-rpms
+#     - rhel-7-server-openstack-13-rpms
+#     - rhel-7-server-rhceph-3-mon-rpms
+#     - rhel-7-server-rhceph-3-tools-rpms
+#   rhsm_activation_key: 'secrete-key'
+
+
+# In some cases, you want to configure specific repos on some roles.
+# Each role can have its own RHSM configuration.
+# Example:
+# ComputeHCIParameters:
+#   RhsmVars:
+#     rhsm_repos:
+#       - rhel-7-server-rpms
+#       - rhel-7-server-extras-rpms
+#       - rhel-ha-for-rhel-7-server-rpms
+#       - rhel-7-server-openstack-13-rpms
+#       - rhel-7-server-rhceph-3-osd-rpms
+#       - rhel-7-server-rhceph-3-mon-rpms
+#       - rhel-7-server-rhceph-3-tools-rpms
+#     rhsm_activation_key: 'anothersecrete-key'
+#
+# More about composable roles:
+# https://docs.openstack.org/tripleo-docs/latest/install/advanced_deployment/role_specific_parameters.html
+#
+# More about ansible-role-redhat-subscription variables:
+# https://github.com/openstack/ansible-role-redhat-subscription

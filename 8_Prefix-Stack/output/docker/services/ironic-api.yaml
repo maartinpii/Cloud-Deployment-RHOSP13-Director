@@ -1,0 +1,228 @@
+heat_template_version: queens
+
+description: >
+  OpenStack containerized Ironic API service
+
+parameters:
+  DockerIronicApiImage:
+    description: image
+    type: string
+  DockerIronicApiConfigImage:
+    description: The container image to use for the ironic_api config_volume
+    type: string
+  EndpointMap:
+    default: {}
+    description: Mapping of service endpoint -> protocol. Typically set
+                 via parameter_defaults in the resource registry.
+    type: json
+  ServiceData:
+    default: {}
+    description: Dictionary packing service data
+    type: json
+  ServiceNetMap:
+    default: {}
+    description: Mapping of service_name -> network name. Typically set
+                 via parameter_defaults in the resource registry.  This
+                 mapping overrides those in ServiceNetMapDefaults.
+    type: json
+  DefaultPasswords:
+    default: {}
+    type: json
+  RoleName:
+    default: ''
+    description: Role name on which the service is applied
+    type: string
+  RoleParameters:
+    default: {}
+    description: Parameters specific to the role
+    type: json
+
+resources:
+
+  ContainersCommon:
+    type: ./containers-common.yaml
+
+  MySQLClient:
+    type: ../../puppet/services/database/mysql-client.yaml
+
+  IronicApiBase:
+    type: ../../puppet/services/ironic-api.yaml
+    properties:
+      EndpointMap: {get_param: EndpointMap}
+      ServiceData: {get_param: ServiceData}
+      ServiceNetMap: {get_param: ServiceNetMap}
+      DefaultPasswords: {get_param: DefaultPasswords}
+      RoleName: {get_param: RoleName}
+      RoleParameters: {get_param: RoleParameters}
+
+outputs:
+  role_data:
+    description: Role data for the Ironic API role.
+    value:
+      service_name: {get_attr: [IronicApiBase, role_data, service_name]}
+      config_settings:
+        map_merge:
+          - get_attr: [IronicApiBase, role_data, config_settings]
+          - apache::default_vhost: false
+      logging_source: {get_attr: [IronicApiBase, role_data, logging_source]}
+      logging_groups: {get_attr: [IronicApiBase, role_data, logging_groups]}
+      service_config_settings: {get_attr: [IronicApiBase, role_data, service_config_settings]}
+      # BEGIN DOCKER SETTINGS
+      puppet_config:
+        config_volume: ironic_api
+        puppet_tags: ironic_config
+        step_config:
+          list_join:
+            - "\n"
+            - - {get_attr: [IronicApiBase, role_data, step_config]}
+              - {get_attr: [MySQLClient, role_data, step_config]}
+        config_image: {get_param: DockerIronicApiConfigImage}
+      kolla_config:
+        /var/lib/kolla/config_files/ironic_api.json:
+          command: /usr/sbin/httpd -DFOREGROUND
+          config_files:
+            - source: "/var/lib/kolla/config_files/src/*"
+              dest: "/"
+              merge: true
+              preserve_properties: true
+          permissions:
+            - path: /var/log/ironic
+              owner: ironic:ironic
+              recurse: true
+      docker_config:
+        # db sync runs before permissions set by kolla_config
+        step_2:
+          ironic_init_logs:
+            image: &ironic_api_image {get_param: DockerIronicApiImage}
+            privileged: false
+            user: root
+            volumes:
+              - /var/log/containers/ironic:/var/log/ironic
+              - /var/log/containers/httpd/ironic-api:/var/log/httpd
+            command: ['/bin/bash', '-c', 'chown -R ironic:ironic /var/log/ironic']
+        step_3:
+          ironic_db_sync:
+            start_order: 1
+            image: *ironic_api_image
+            net: host
+            privileged: false
+            detach: false
+            user: root
+            volumes:
+              list_concat:
+                - {get_attr: [ContainersCommon, volumes]}
+                -
+                  - /var/lib/config-data/ironic_api/etc/ironic:/etc/ironic:ro
+                  - /var/log/containers/ironic:/var/log/ironic
+                  - /var/log/containers/httpd/ironic-api:/var/log/httpd
+            command: "/usr/bin/bootstrap_host_exec ironic_api su ironic -s /bin/bash -c 'ironic-dbsync --config-file /etc/ironic/ironic.conf'"
+        step_4:
+          ironic_api:
+            start_order: 10
+            image: *ironic_api_image
+            net: host
+            user: root
+            restart: always
+            healthcheck:
+              test: /openstack/healthcheck
+            volumes:
+              list_concat:
+                - {get_attr: [ContainersCommon, volumes]}
+                -
+                  - /var/lib/kolla/config_files/ironic_api.json:/var/lib/kolla/config_files/config.json:ro
+                  - /var/lib/config-data/puppet-generated/ironic_api/:/var/lib/kolla/config_files/src:ro
+                  - /var/log/containers/ironic:/var/log/ironic
+                  - /var/log/containers/httpd/ironic-api:/var/log/httpd
+            environment:
+              - KOLLA_CONFIG_STRATEGY=COPY_ALWAYS
+      host_prep_tasks:
+        - name: create persistent logs directory
+          file:
+            path: "{{ item }}"
+            state: directory
+          with_items:
+            - /var/log/containers/ironic
+            - /var/log/containers/httpd/ironic-api
+        - name: ironic logs readme
+          copy:
+            dest: /var/log/ironic/readme.txt
+            content: |
+              Log files from ironic containers can be found under
+              /var/log/containers/ironic and /var/log/containers/httpd/ironic-*.
+          ignore_errors: true
+      upgrade_tasks:
+        - name: Check if ironic_api is deployed
+          command: systemctl is-enabled --quiet openstack-ironic-api
+          tags: common
+          ignore_errors: True
+          register: ironic_api_enabled
+        - name: Check for ironic_api running under apache
+          tags: common
+          shell: "httpd -t -D DUMP_VHOSTS | grep -q ironic"
+          ignore_errors: True
+          register: httpd_enabled
+        - name: "PreUpgrade step0,validation: Check service openstack-ironic-api is running"
+          command: systemctl is-active --quiet openstack-ironic-api
+          when:
+            - step|int == 0
+            - ironic_api_enabled.rc == 0
+            - httpd_enabled.rc != 0
+          tags: validation
+        - name: Stop and disable ironic_api service
+          when:
+            - step|int == 2
+            - ironic_api_enabled.rc == 0
+            - httpd_enabled.rc != 0
+          service: name=openstack-ironic-api state=stopped enabled=no
+        - name: Check if httpd service is running
+          command: systemctl is-active --quiet httpd
+          tags: common
+          ignore_errors: True
+          register: httpd_running
+        - name: "PreUpgrade step0,validation: Check if ironic_api_wsgi is running"
+          shell: systemctl status 'httpd' | grep -q ironic
+          tags: validation
+          when:
+            - step|int == 0
+            - httpd_enabled.rc == 0
+            - httpd_running.rc == 0
+        - name: Stop ironic_api service (running under httpd)
+          when:
+            - step|int == 2
+            - httpd_enabled.rc == 0
+            - httpd_running.rc == 0
+          service: name=httpd state=stopped enabled=no
+      fast_forward_upgrade_tasks:
+        - block:
+            - name: Check if ironic_api is deployed
+              command: systemctl is-enabled --quiet openstack-ironic-api
+              ignore_errors: True
+              register: ironic_api_enabled_result
+            - name: Set fact ironic_api_enabled
+              set_fact:
+                ironic_api_enabled: "{{ ironic_api_enabled_result.rc == 0 }}"
+          when:
+            - step|int == 0
+            - release == 'ocata'
+        - name: Stop openstack-ironic-api
+          service: name=openstack-ironic-api state=stopped enabled=no
+          when:
+            - step|int == 1
+            - release == 'ocata'
+            - ironic_api_enabled|bool
+        - name: Ironic package update
+          shell: yum -y update openstack-ironic*
+          when:
+            - step|int == 6
+            - is_bootstrap_node|bool
+        - name: Synchronize the database
+          command: ironic-dbsync --config-file /etc/ironic/ironic.conf upgrade
+          when:
+            - step|int == 8
+            - is_bootstrap_node|bool
+        - name: Do online data migration
+          command: ironic-dbsync --config-file /etc/ironic/ironic.conf online_data_migrations
+          when:
+            - step|int == 8
+            - is_bootstrap_node|bool
+            - release == 'pike'

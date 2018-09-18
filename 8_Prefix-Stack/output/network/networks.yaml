@@ -1,0 +1,51 @@
+heat_template_version: queens
+
+description: Create networks to split out Overcloud traffic
+
+resources:
+  StorageNetwork:
+    type: OS::TripleO::Network::Storage
+  StorageMgmtNetwork:
+    type: OS::TripleO::Network::StorageMgmt
+  InternalApiNetwork:
+    type: OS::TripleO::Network::InternalApi
+  TenantNetwork:
+    type: OS::TripleO::Network::Tenant
+  ExternalNetwork:
+    type: OS::TripleO::Network::External
+  ManagementNetwork:
+    type: OS::TripleO::Network::Management
+
+  NetworkExtraConfig:
+    type: OS::TripleO::Network::ExtraConfig
+
+
+outputs:
+  net_cidr_map:
+    value:
+      # NOTE(gfidente): we need to replace the null value with a
+      # string to work around https://bugs.launchpad.net/heat/+bug/1700025
+      storage:
+        yaql:
+          data: {get_attr: [StorageNetwork, subnet_cidr]}
+          expression: str($.data).replace('null', 'disabled')
+      storage_mgmt:
+        yaql:
+          data: {get_attr: [StorageMgmtNetwork, subnet_cidr]}
+          expression: str($.data).replace('null', 'disabled')
+      internal_api:
+        yaql:
+          data: {get_attr: [InternalApiNetwork, subnet_cidr]}
+          expression: str($.data).replace('null', 'disabled')
+      tenant:
+        yaql:
+          data: {get_attr: [TenantNetwork, subnet_cidr]}
+          expression: str($.data).replace('null', 'disabled')
+      external:
+        yaql:
+          data: {get_attr: [ExternalNetwork, subnet_cidr]}
+          expression: str($.data).replace('null', 'disabled')
+      management:
+        yaql:
+          data: {get_attr: [ManagementNetwork, subnet_cidr]}
+          expression: str($.data).replace('null', 'disabled')

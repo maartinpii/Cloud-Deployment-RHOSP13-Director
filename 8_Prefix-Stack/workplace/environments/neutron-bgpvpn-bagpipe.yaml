@@ -1,0 +1,27 @@
+# A Heat environment file that can be used to deploy Neutron Bagpipe driver as
+# backend for BGPVPN service plugin
+#
+# The BaGPipe driver for the BGPVPN service plugin is designed to work jointly
+# with the openvswitch ML2 mechanism driver. It relies on the use of the
+# bagpipe-bgp BGP VPN implementation on compute node and the MPLS implementation
+# in OpenVSwitch.
+#
+resource_registry:
+  OS::TripleO::Services::NeutronBgpVpnApi: ../docker/services/neutron-bgpvpn-api.yaml
+  # FIXME(bogdando): switch it, once it is containerized
+  OS::TripleO::Services::NeutronBgpVpnBagpipe: ../puppet/services/neutron-bgpvpn-bagpipe.yaml
+
+parameter_defaults:
+
+  NeutronServicePlugins: 'router,bgpvpn'
+  BgpvpnServiceProvider: 'BGPVPN:BaGPipe:networking_bgpvpn.neutron.services.service_drivers.bagpipe.bagpipe.BaGPipeBGPVPNDriver:default'
+
+  # Required (example)
+  # BagpipeMyAs: 64512
+
+  # Optional (example)
+  # BagpipeApiPort: 8084
+  # BagpipeDataplaneDriverIpVpn: 'ovs'
+  # BagpipeEnableRtc: true
+  # BagpipeOvsBridge: br-mpls
+  # BagpipePeers: 192.168.10.1,192.168.10.2

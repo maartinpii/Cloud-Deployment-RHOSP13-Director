@@ -1,0 +1,287 @@
+heat_template_version: queens
+
+description: >
+  OpenStack containerized Neutron L3 agent
+
+parameters:
+  DockerNeutronL3AgentImage:
+    description: image
+    type: string
+  DockerNeutronConfigImage:
+    description: The container image to use for the neutron config_volume
+    type: string
+  DockerNeutronL3AgentUlimit:
+    default: ['nofile=1024']
+    description: ulimit for Neutron L3 Agent Container
+    type: comma_delimited_list
+  NeutronEnableKeepalivedWrapper:
+    description: Generate a wrapper script so neutron launches keepalived processes in a
+                 separate container.
+    type: boolean
+    default: true
+  NeutronEnableHaproxyDockerWrapper:
+    description: Generate a wrapper script so neutron launches haproxy in a separate container.
+    type: boolean
+    default: true
+  NeutronEnableDibblerDockerWrapper:
+    description: Generate a wrapper script so neutron launches the dibbler client in a separate
+                 container.
+    type: boolean
+    default: true
+  NeutronEnableRadvdDockerWrapper:
+    description: Generate a wrapper script so neutron launches radvd in a separate container. Note
+                 that is currently disabled by default pending availability of a fix to radvd
+                 (see https://bugzilla.redhat.com/show_bug.cgi?id=1564391). It will be enabled by default
+                 once the fix to radvd is generally available across target distributions.
+    type: boolean
+    default: false
+  ServiceData:
+    default: {}
+    description: Dictionary packing service data
+    type: json
+  ServiceNetMap:
+    default: {}
+    description: Mapping of service_name -> network name. Typically set
+                 via parameter_defaults in the resource registry.  This
+                 mapping overrides those in ServiceNetMapDefaults.
+    type: json
+  DefaultPasswords:
+    default: {}
+    type: json
+  RoleName:
+    default: ''
+    description: Role name on which the service is applied
+    type: string
+  RoleParameters:
+    default: {}
+    description: Parameters specific to the role
+    type: json
+  EndpointMap:
+    default: {}
+    description: Mapping of service endpoint -> protocol. Typically set
+                 via parameter_defaults in the resource registry.
+    type: json
+
+conditions:
+  keepalived_wrapper_enabled: {equals: [{get_param: NeutronEnableKeepalivedWrapper}, true]}
+  haproxy_wrapper_enabled: {equals: [{get_param: NeutronEnableHaproxyDockerWrapper}, true]}
+  dibbler_wrapper_enabled: {equals: [{get_param: NeutronEnableDibblerDockerWrapper}, true]}
+  radvd_wrapper_enabled: {equals: [{get_param: NeutronEnableRadvdDockerWrapper}, true]}
+
+resources:
+
+  ContainersCommon:
+    type: ./containers-common.yaml
+
+  NeutronL3Base:
+    type: ../../puppet/services/neutron-l3.yaml
+    properties:
+      EndpointMap: {get_param: EndpointMap}
+      ServiceData: {get_param: ServiceData}
+      ServiceNetMap: {get_param: ServiceNetMap}
+      DefaultPasswords: {get_param: DefaultPasswords}
+      RoleName: {get_param: RoleName}
+      RoleParameters: {get_param: RoleParameters}
+
+  NeutronLogging:
+    type: OS::TripleO::Services::Logging::NeutronCommon
+    properties:
+      NeutronServiceName: l3-agent
+
+outputs:
+  role_data:
+    description: Role data for Neutron L3 agent
+    value:
+      service_name: {get_attr: [NeutronL3Base, role_data, service_name]}
+      config_settings:
+        map_merge:
+          - get_attr: [NeutronL3Base, role_data, config_settings]
+          - get_attr: [NeutronLogging, config_settings]
+          - tripleo::profile::base::neutron::l3_agent_wrappers::enable_keepalived_wrapper: {get_param: NeutronEnableKeepalivedWrapper}
+            tripleo::profile::base::neutron::l3_agent_wrappers::keepalived_process_wrapper: '/var/lib/neutron/keepalived_wrapper'
+            # TODO(beagles): this can be removed after a cleanup of the related puppet-tripleo code.
+            tripleo::profile::base::neutron::l3_agent_wrappers::keepalived_state_change_wrapper: '/var/lib/neutron/keepalived_state_change_wrapper'
+            tripleo::profile::base::neutron::l3_agent_wrappers::keepalived_image: {get_param: DockerNeutronL3AgentImage}
+            tripleo::profile::base::neutron::l3_agent_wrappers::enable_haproxy_wrapper: {get_param: NeutronEnableHaproxyDockerWrapper}
+            tripleo::profile::base::neutron::l3_agent_wrappers::haproxy_process_wrapper: '/var/lib/neutron/l3_haproxy_wrapper'
+            tripleo::profile::base::neutron::l3_agent_wrappers::haproxy_image: {get_param: DockerNeutronL3AgentImage}
+            tripleo::profile::base::neutron::l3_agent_wrappers::enable_dibbler_wrapper: {get_param: NeutronEnableDibblerDockerWrapper}
+            tripleo::profile::base::neutron::l3_agent_wrappers::dibbler_process_wrapper: '/var/lib/neutron/dibbler_wrapper'
+            tripleo::profile::base::neutron::l3_agent_wrappers::dibbler_image: {get_param: DockerNeutronL3AgentImage}
+            tripleo::profile::base::neutron::l3_agent_wrappers::enable_radvd_wrapper: {get_param: NeutronEnableRadvdDockerWrapper}
+            tripleo::profile::base::neutron::l3_agent_wrappers::radvd_process_wrapper: '/var/lib/neutron/radvd_wrapper'
+            tripleo::profile::base::neutron::l3_agent_wrappers::radvd_image: {get_param: DockerNeutronL3AgentImage}
+
+      logging_source: {get_attr: [NeutronL3Base, role_data, logging_source]}
+      logging_groups: {get_attr: [NeutronL3Base, role_data, logging_groups]}
+      service_config_settings: {get_attr: [NeutronL3Base, role_data, service_config_settings]}
+      puppet_config:
+        puppet_tags: neutron_config,neutron_l3_agent_config
+        config_volume: neutron
+        step_config:
+          get_attr: [NeutronL3Base, role_data, step_config]
+        config_image: {get_param: DockerNeutronConfigImage}
+      kolla_config:
+        /var/lib/kolla/config_files/neutron_l3_agent.json:
+          command:
+            list_join:
+              - ' '
+              - - /usr/bin/neutron-l3-agent --config-file /usr/share/neutron/neutron-dist.conf --config-dir /usr/share/neutron/l3_agent --config-file /etc/neutron/neutron.conf --config-file /etc/neutron/l3_agent.ini --config-dir /etc/neutron/conf.d/common --config-dir /etc/neutron/conf.d/neutron-l3-agent
+                - get_attr: [NeutronLogging, cmd_extra_args]
+          config_files:
+            - source: "/var/lib/kolla/config_files/src/*"
+              dest: "/"
+              merge: true
+              preserve_properties: true
+          permissions:
+            - path: /var/log/neutron
+              owner: neutron:neutron
+              recurse: true
+            - path: /var/lib/neutron
+              owner: neutron:neutron
+              recurse: true
+      docker_config_scripts: {get_attr: [ContainersCommon, docker_config_scripts]}
+      docker_config:
+        step_2:
+          create_keepalived_wrapper:
+            start_order: 1
+            detach: false
+            net: host
+            pid: host
+            user: root
+            command: # '/docker_puppet_apply.sh "STEP" "TAGS" "CONFIG" "DEBUG"'
+              list_concat:
+                -
+                  - '/docker_puppet_apply.sh'
+                  - '4'
+                  - 'file'
+                  - 'include ::tripleo::profile::base::neutron::l3_agent_wrappers'
+            image: {get_param: DockerNeutronL3AgentImage}
+            volumes:
+              list_concat:
+                - {get_attr: [ContainersCommon, docker_puppet_apply_volumes]}
+                -
+                  - /run/openvswitch:/run/openvswitch
+                  - /var/lib/neutron:/var/lib/neutron
+        step_4:
+          neutron_l3_agent:
+            start_order: 10
+            image: {get_param: DockerNeutronL3AgentImage}
+            net: host
+            pid: host
+            privileged: true
+            restart: always
+            healthcheck:
+              test: /openstack/healthcheck
+            ulimit: {get_param: DockerNeutronL3AgentUlimit}
+            volumes:
+              list_concat:
+                - {get_attr: [ContainersCommon, volumes]}
+                - {get_attr: [NeutronLogging, volumes]}
+                -
+                  - /var/lib/kolla/config_files/neutron_l3_agent.json:/var/lib/kolla/config_files/config.json:ro
+                  - /var/lib/config-data/puppet-generated/neutron/:/var/lib/kolla/config_files/src:ro
+                  - /lib/modules:/lib/modules:ro
+                  - /run/openvswitch:/run/openvswitch
+                  - /var/lib/neutron:/var/lib/neutron
+                  - /run/netns:/run/netns:shared
+                  - /var/lib/openstack:/var/lib/openstack
+                -
+                  if:
+                    - keepalived_wrapper_enabled
+                    - - /var/lib/neutron/keepalived_wrapper:/usr/local/bin/keepalived:ro
+                    - null
+                -
+                  if:
+                    - haproxy_wrapper_enabled
+                    - - /var/lib/neutron/l3_haproxy_wrapper:/usr/local/bin/haproxy:ro
+                    - null
+                -
+                  if:
+                    - radvd_wrapper_enabled
+                    - - /var/lib/neutron/radvd_wrapper:/usr/local/bin/radvd:ro
+                    - null
+                -
+                  if:
+                    - dibbler_wrapper_enabled
+                    - - /var/lib/neutron/dibbler_wrapper:/usr/local/bin/dibbler_client:ro
+                    - null
+            environment:
+              - KOLLA_CONFIG_STRATEGY=COPY_ALWAYS
+      metadata_settings:
+        get_attr: [NeutronL3Base, role_data, metadata_settings]
+      host_prep_tasks:
+        list_concat:
+          - {get_attr: [NeutronLogging, host_prep_tasks]}
+          - - name: create /var/lib/neutron
+              file:
+                path: /var/lib/neutron
+                state: directory
+      upgrade_tasks:
+        - name: Check if neutron_l3_agent is deployed
+          command: systemctl is-enabled --quiet neutron-l3-agent
+          tags: common
+          ignore_errors: True
+          register: neutron_l3_agent_enabled
+        - name: "PreUpgrade step0,validation: Check service neutron-l3-agent is running"
+          command: systemctl is-active --quiet neutron-l3-agent
+          when:
+            - step|int == 0
+            - neutron_l3_agent_enabled.rc == 0
+          tags: validation
+        - name: Stop and disable neutron_l3 service
+          when:
+            - step|int == 2
+            - neutron_l3_agent_enabled.rc == 0
+          service: name=neutron-l3-agent state=stopped enabled=no
+      fast_forward_upgrade_tasks:
+        - name: Check if neutron_l3_agent is deployed
+          command: systemctl is-enabled --quiet neutron-l3-agent
+          ignore_errors: True
+          register: neutron_l3_agent_enabled_result
+          when:
+            - step|int == 0
+            - release == 'ocata'
+        - name: Set fact neutron_l3_agent_enabled
+          set_fact:
+            neutron_l3_agent_enabled: "{{ neutron_l3_agent_enabled_result.rc == 0 }}"
+          when:
+            - step|int == 0
+            - release == 'ocata'
+        - name: Stop neutron_l3_agent
+          service: name=neutron-l3-agent state=stopped enabled=no
+          when:
+            - step|int == 1
+            - release == 'ocata'
+            - neutron_l3_agent_enabled|bool
+      post_upgrade_tasks:
+        - name: Check for neutron user
+          getent:
+            database: passwd
+            key: neutron
+          ignore_errors: True
+        - name: Set neutron_user_avail
+          set_fact:
+            neutron_user_avail: "{{ getent_passwd is defined }}"
+        - when:
+            - step|int == 2
+            - neutron_user_avail|bool
+          block:
+            - name: Ensure r/w access for existing files after upgrade
+              become: true
+              shell: |
+                umask 0002
+                setfacl -d -R -m u:neutron:rwx /var/lib/neutron
+                setfacl -R -m u:neutron:rw /var/lib/neutron
+                find /var/lib/neutron -type d -exec setfacl -m u:neutron:rwx '{}' \;
+            - name: Provide access to domain sockets
+              become: true
+              shell: |
+                umask 0002
+                setfacl -m u:neutron:rwx "{{ item }}"
+              with_items:
+                - /var/lib/neutron/metadata_proxy
+                - /var/lib/neutron/keepalived-state-change
+                - /var/lib/neutron
+              # These files are not necessarily present
+              ignore_errors: True

@@ -1,0 +1,12 @@
+diff --git a/templates/roles_data.yaml b/templates/roles_data.yaml
+index d870f25..e054076 100644
+--- a/templates/roles_data.yaml
++++ b/templates/roles_data.yaml
+@@ -185,6 +185,7 @@
+     - InternalApi
+     - Tenant
+     - Storage
++    - External
+   HostnameFormatDefault: '%stackname%-compute-%index%'
+   # Deprecated & backward-compatible values (FIXME: Make parameters consistent)
+   # Set uses_deprecated_params to True if any deprecated params are used.

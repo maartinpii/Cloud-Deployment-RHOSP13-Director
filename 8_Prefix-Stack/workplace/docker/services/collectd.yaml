@@ -1,0 +1,172 @@
+heat_template_version: queens
+
+description: >
+  Containerized collectd service
+
+parameters:
+  DockerCollectdImage:
+    description: image
+    type: string
+  DockerCollectdConfigImage:
+    description: The container image to use for the collectd config_volume
+    type: string
+  EndpointMap:
+    default: {}
+    description: Mapping of service endpoint -> protocol. Typically set
+                 via parameter_defaults in the resource registry.
+    type: json
+  ServiceData:
+    default: {}
+    description: Dictionary packing service data
+    type: json
+  ServiceNetMap:
+    default: {}
+    description: Mapping of service_name -> network name. Typically set
+                 via parameter_defaults in the resource registry.  This
+                 mapping overrides those in ServiceNetMapDefaults.
+    type: json
+  DefaultPasswords:
+    default: {}
+    type: json
+  RoleName:
+    default: ''
+    description: Role name on which the service is applied
+    type: string
+  RoleParameters:
+    default: {}
+    description: Parameters specific to the role
+    type: json
+  UpgradeRemoveUnusedPackages:
+    default: false
+    description: Remove package if the service is being disabled during upgrade
+    type: boolean
+
+resources:
+
+  ContainersCommon:
+    type: ./containers-common.yaml
+
+  CollectdBase:
+    type: ../../puppet/services/metrics/collectd.yaml
+    properties:
+      EndpointMap: {get_param: EndpointMap}
+      ServiceData: {get_param: ServiceData}
+      ServiceNetMap: {get_param: ServiceNetMap}
+      DefaultPasswords: {get_param: DefaultPasswords}
+      RoleName: {get_param: RoleName}
+      RoleParameters: {get_param: RoleParameters}
+
+outputs:
+  role_data:
+    description: Role data for the collectd role.
+    value:
+      service_name: {get_attr: [CollectdBase, role_data, service_name]}
+      config_settings:
+        map_merge:
+          - get_attr: [CollectdBase, role_data, config_settings]
+          - tripleo::profile::base::metrics::collectd::enable_file_logging: true
+            collectd::plugin::logfile::log_file: /var/log/collectd/collectd.log
+      logging_source: {get_attr: [CollectdBase, role_data, logging_source]}
+      logging_groups: {get_attr: [CollectdBase, role_data, logging_groups]}
+      service_config_settings: {get_attr: [CollectdBase, role_data, service_config_settings]}
+      # BEGIN DOCKER SETTINGS
+      puppet_config:
+        config_volume: collectd
+        puppet_tags:  collectd_client_config
+        step_config:
+          get_attr: [CollectdBase, role_data, step_config]
+        config_image: {get_param: DockerCollectdConfigImage}
+      kolla_config:
+        /var/lib/kolla/config_files/collectd.json:
+          command: /usr/sbin/collectd -f
+          config_files:
+            - source: "/var/lib/kolla/config_files/src/*"
+              dest: "/"
+              merge: true
+              preserve_properties: true
+          permissions:
+            - path: /var/log/collectd
+              owner: collectd:collectd
+              recurse: true
+      docker_config:
+        step_5:
+          collectd:
+            image: {get_param: DockerCollectdImage}
+            net: host
+            pid: host
+            privileged: true
+            user: root
+            restart: always
+            healthcheck:
+              test: /openstack/healthcheck
+            volumes:
+              list_concat:
+                - {get_attr: [ContainersCommon, volumes]}
+                -
+                  - /var/lib/kolla/config_files/collectd.json:/var/lib/kolla/config_files/config.json:ro
+                  - /var/lib/config-data/puppet-generated/collectd/:/var/lib/kolla/config_files/src:ro
+                  - /var/log/containers/collectd:/var/log/collectd:rw
+                  - /var/run/openvswitch:/var/run/openvswitch:ro
+                  - /var/run/ceph:/var/run/ceph:ro
+                  - /var/run/libvirt:/var/run/libvirt:ro
+            environment:
+              - KOLLA_CONFIG_STRATEGY=COPY_ALWAYS
+      host_prep_tasks:
+        - name: create persistent logs directory
+          file:
+            path: /var/log/containers/collectd
+            state: directory
+        - name: collectd logs readme
+          copy:
+            dest: /var/log/collectd/readme.txt
+            content: |
+              Log files from collectd containers can be found under
+              /var/log/containers/collectd.
+          ignore_errors: true
+      upgrade_tasks:
+        - name: Check if collectd is deployed
+          command: systemctl is-enabled --quiet collectd
+          tags: common
+          ignore_errors: True
+          register: collectd_enabled
+        - name: "PreUpgrade step0,validation: Check service collectd service is running"
+          command: systemctl is-active --quiet collectd
+          when:
+            - step|int == 0
+            - collectd_enabled.rc == 0
+          tags: validation
+        - name: Stop and disable collectd service
+          when:
+            - step|int == 2
+            - collectd_enabled.rc == 0
+          service: name=collectd.service state=stopped enabled=no
+        - name: Set fact for removal of collectd package
+          when: step|int == 2
+          set_fact:
+            remove_collectd_package: {get_param: UpgradeRemoveUnusedPackages}
+        - name: Remove collectd package if operator requests it
+          yum: name=collectd state=removed
+          ignore_errors: True
+          when:
+            - step|int == 2
+            - remove_collectd_package|bool
+      fast_forward_upgrade_tasks:
+        - name: Check if collectd.service is deployed
+          command: systemctl is-enabled --quiet collectd.service
+          ignore_errors: True
+          register: collectd_enabled_result
+          when:
+            - step|int == 0
+            - release == 'ocata'
+        - name: Set fact collectd_enabled
+          set_fact:
+            collectd_enabled: "{{ collectd_enabled_result.rc == 0 }}"
+          when:
+            - step|int == 0
+            - release == 'ocata'
+        - name: Stop collectd service
+          service: name=collectd.service state=stopped enabled=no
+          when:
+            - step|int == 1
+            - release == 'ocata'
+            - collectd_enabled|bool

@@ -1,0 +1,43 @@
+diff --git a/templates/nic-configs/compute.yaml b/templates/nic-configs/compute.yaml
+index 2ba9ba5..67de0ea 100644
+--- a/templates/nic-configs/compute.yaml
++++ b/templates/nic-configs/compute.yaml
+@@ -84,8 +84,8 @@ resources:
+           params:
+             $network_config:
+               network_config:
+-              - type: ovs_bridge
+-                name: bridge_name
++              - type: interface
++                name: nic1
+                 use_dhcp: false
+                 dns_servers:
+                   get_param: DnsServers
+@@ -102,9 +102,12 @@ resources:
+                 - default: true
+                   next_hop:
+                     get_param: ControlPlaneDefaultRoute
++              - type: ovs_bridge
++                name: bridge_name
++                use_dhcp: false
+                 members:
+                 - type: interface
+-                  name: nic1
++                  name: nic2
+                   # force the MAC address of the bridge to this interface
+                   primary: true
+                 - type: vlan
+@@ -128,11 +131,8 @@ resources:
+                 - type: vlan
+                   vlan_id:
+                     get_param: ExternalNetworkVlanID
+-                  addresses:
+-                  - ip_netmask:
+-                      get_param: ExternalIpSubnet
+ outputs:
+   OS::stack_id:
+     description: The OsNetConfigImpl resource.
+     value:
+-      get_resource: OsNetConfigImpl
+\ No newline at end of file
++      get_resource: OsNetConfigImpl

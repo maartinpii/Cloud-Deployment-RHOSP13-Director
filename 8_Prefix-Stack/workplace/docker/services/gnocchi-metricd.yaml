@@ -1,0 +1,193 @@
+heat_template_version: queens
+
+description: >
+  OpenStack containerized Gnocchi Metricd service
+
+parameters:
+  DockerGnocchiMetricdImage:
+    description: image
+    type: string
+  DockerGnocchiConfigImage:
+    description: The container image to use for the gnocchi config_volume
+    type: string
+  EndpointMap:
+    default: {}
+    description: Mapping of service endpoint -> protocol. Typically set
+                 via parameter_defaults in the resource registry.
+    type: json
+  ServiceData:
+    default: {}
+    description: Dictionary packing service data
+    type: json
+  ServiceNetMap:
+    default: {}
+    description: Mapping of service_name -> network name. Typically set
+                 via parameter_defaults in the resource registry.  This
+                 mapping overrides those in ServiceNetMapDefaults.
+    type: json
+  DefaultPasswords:
+    default: {}
+    type: json
+  RoleName:
+    default: ''
+    description: Role name on which the service is applied
+    type: string
+  RoleParameters:
+    default: {}
+    description: Parameters specific to the role
+    type: json
+  CephClientUserName:
+    default: openstack
+    type: string
+  CephClusterName:
+    type: string
+    default: ceph
+    description: The Ceph cluster name.
+    constraints:
+    - allowed_pattern: "[a-zA-Z0-9]+"
+      description: >
+        The Ceph cluster name must be at least 1 character and contain only
+        letters and numbers.
+  GnocchiFileBasePath:
+    default: '/var/lib/gnocchi'
+    description: Path to use when file driver is used. This could be NFS or a
+      flat file.
+    type: string
+
+resources:
+
+  ContainersCommon:
+    type: ./containers-common.yaml
+
+  MySQLClient:
+    type: ../../puppet/services/database/mysql-client.yaml
+
+  GnocchiMetricdBase:
+    type: ../../puppet/services/gnocchi-metricd.yaml
+    properties:
+      EndpointMap: {get_param: EndpointMap}
+      ServiceData: {get_param: ServiceData}
+      ServiceNetMap: {get_param: ServiceNetMap}
+      DefaultPasswords: {get_param: DefaultPasswords}
+      RoleName: {get_param: RoleName}
+      RoleParameters: {get_param: RoleParameters}
+
+outputs:
+  role_data:
+    description: Role data for the Gnocchi API role.
+    value:
+      service_name: {get_attr: [GnocchiMetricdBase, role_data, service_name]}
+      config_settings: {get_attr: [GnocchiMetricdBase, role_data, config_settings]}
+      logging_source: {get_attr: [GnocchiMetricdBase, role_data, logging_source]}
+      logging_groups: {get_attr: [GnocchiMetricdBase, role_data, logging_groups]}
+      service_config_settings: {get_attr: [GnocchiMetricdBase, role_data, service_config_settings]}
+      # BEGIN DOCKER SETTINGS
+      puppet_config:
+        config_volume: gnocchi
+        puppet_tags: gnocchi_config
+        step_config:
+          list_join:
+            - "\n"
+            - - {get_attr: [GnocchiMetricdBase, role_data, step_config]}
+              - {get_attr: [MySQLClient, role_data, step_config]}
+        config_image: {get_param: DockerGnocchiConfigImage}
+      kolla_config:
+        /var/lib/kolla/config_files/gnocchi_metricd.json:
+          command: /usr/bin/gnocchi-metricd
+          config_files:
+            - source: "/var/lib/kolla/config_files/src/*"
+              dest: "/"
+              merge: true
+              preserve_properties: true
+            - source: "/var/lib/kolla/config_files/src-ceph/"
+              dest: "/etc/ceph/"
+              merge: true
+              preserve_properties: true
+          permissions:
+            - path: /var/log/gnocchi
+              owner: gnocchi:gnocchi
+              recurse: true
+            - path:
+                str_replace:
+                  template: /etc/ceph/CLUSTER.client.USER.keyring
+                  params:
+                    CLUSTER: {get_param: CephClusterName}
+                    USER: {get_param: CephClientUserName}
+              owner: gnocchi:gnocchi
+              perm: '0600'
+      docker_config:
+        step_5:
+          gnocchi_metricd:
+            start_order: 1
+            image: {get_param: DockerGnocchiMetricdImage}
+            net: host
+            privileged: false
+            restart: always
+            healthcheck:
+              test: /openstack/healthcheck
+            volumes:
+              list_concat:
+                - {get_attr: [ContainersCommon, volumes]}
+                -
+                  - /var/lib/kolla/config_files/gnocchi_metricd.json:/var/lib/kolla/config_files/config.json:ro
+                  - /var/lib/config-data/puppet-generated/gnocchi/:/var/lib/kolla/config_files/src:ro
+                  - /var/log/containers/gnocchi:/var/log/gnocchi
+                  - /etc/ceph:/var/lib/kolla/config_files/src-ceph:ro
+                  - str_replace:
+                      template: GNOCCHI_FILE_BASE_PATH:GNOCCHI_FILE_BASE_PATH
+                      params: {GNOCCHI_FILE_BASE_PATH: {get_param: GnocchiFileBasePath}}
+            environment:
+              - KOLLA_CONFIG_STRATEGY=COPY_ALWAYS
+      host_prep_tasks:
+        - name: create persistent logs directory
+          file:
+            path: /var/log/containers/gnocchi
+            state: directory
+        - name: gnocchi logs readme
+          copy:
+            dest: /var/log/gnocchi/readme.txt
+            content: |
+              Log files from gnocchi containers can be found under
+              /var/log/containers/gnocchi and /var/log/containers/httpd/gnocchi-api.
+          ignore_errors: true
+        - name: ensure ceph configurations exist
+          file:
+            path: /etc/ceph
+            state: directory
+      upgrade_tasks:
+        - name: Check if gnocchi_metricd is deployed
+          command: systemctl is-enabled --quiet openstack-gnocchi-metricd
+          tags: common
+          ignore_errors: True
+          register: gnocchi_metricd_enabled
+        - name: "PreUpgrade step0,validation: Check service openstack-gnocchi-metricd is running"
+          command: systemctl is-active --quiet openstack-gnocchi-metricd
+          when:
+            - step|int == 0
+            - gnocchi_metricd_enabled.rc == 0
+          tags: validation
+        - name: Stop and disable openstack-gnocchi-metricd service
+          when:
+            - step|int == 2
+            - gnocchi_metricd_enabled.rc == 0
+          service: name=openstack-gnocchi-metricd.service state=stopped enabled=no
+      fast_forward_upgrade_tasks:
+        - name: FFU check if openstack-gnocchi-metricd is deployed
+          command: systemctl is-enabled --quiet openstack-gnocchi-metricd
+          ignore_errors: True
+          register: gnocchi_metricd_enabled_result
+          when:
+            - step|int == 0
+            - release == 'ocata'
+        - name: Set fact gnocchi_metricd_enabled
+          set_fact:
+            gnocchi_metricd_enabled: "{{ gnocchi_metricd_enabled_result.rc == 0 }}"
+          when:
+            - step|int == 0
+            - release == 'ocata'
+        - name: FFU stop and disable openstack-gnocchi-metricd service
+          service: name=openstack-gnocchi-metricd state=stopped enabled=no
+          when:
+            - step|int == 1
+            - release == 'ocata'
+            - gnocchi_metricd_enabled|bool

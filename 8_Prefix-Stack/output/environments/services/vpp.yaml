@@ -1,0 +1,10 @@
+resource_registry:
+  # FIXME(bogdando): switch it, once it is containerized
+  OS::TripleO::Services::Vpp: ../../puppet/services/vpp.yaml
+
+#parameter_defaults:
+  #VPP main thread core pinning
+  #VppCpuMainCore: '1'
+
+  #List of cores for VPP worker thread pinning
+  #VppCpuCorelistWorkers: ['3','4']

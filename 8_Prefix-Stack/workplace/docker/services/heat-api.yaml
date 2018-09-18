@@ -1,0 +1,248 @@
+heat_template_version: queens
+
+description: >
+  OpenStack containerized Heat API service
+
+parameters:
+  DockerHeatApiImage:
+    description: image
+    type: string
+  # puppet needs the heat-wsgi-api binary from centos-binary-heat-api
+  DockerHeatApiConfigImage:
+    description: The container image to use for the heat_api config_volume
+    type: string
+  EndpointMap:
+    default: {}
+    description: Mapping of service endpoint -> protocol. Typically set
+                 via parameter_defaults in the resource registry.
+    type: json
+  ServiceData:
+    default: {}
+    description: Dictionary packing service data
+    type: json
+  ServiceNetMap:
+    default: {}
+    description: Mapping of service_name -> network name. Typically set
+                 via parameter_defaults in the resource registry.  This
+                 mapping overrides those in ServiceNetMapDefaults.
+    type: json
+  DefaultPasswords:
+    default: {}
+    type: json
+  RoleName:
+    default: ''
+    description: Role name on which the service is applied
+    type: string
+  RoleParameters:
+    default: {}
+    description: Parameters specific to the role
+    type: json
+  EnableInternalTLS:
+    type: boolean
+    default: false
+  HeatApiOptVolumes:
+    default: []
+    description: list of optional volumes to be mounted
+    type: comma_delimited_list
+  HeatApiOptEnvVars:
+    default: []
+    description: list of optional environment variables
+    type: comma_delimited_list
+
+conditions:
+
+  internal_tls_enabled: {equals: [{get_param: EnableInternalTLS}, true]}
+
+resources:
+
+  ContainersCommon:
+    type: ./containers-common.yaml
+
+  HeatBase:
+    type: ../../puppet/services/heat-api.yaml
+    properties:
+      EndpointMap: {get_param: EndpointMap}
+      ServiceData: {get_param: ServiceData}
+      ServiceNetMap: {get_param: ServiceNetMap}
+      DefaultPasswords: {get_param: DefaultPasswords}
+      RoleName: {get_param: RoleName}
+      RoleParameters: {get_param: RoleParameters}
+
+  HeatApiLogging:
+    type: OS::TripleO::Services::Logging::HeatApi
+
+outputs:
+  role_data:
+    description: Role data for the Heat API role.
+    value:
+      service_name: {get_attr: [HeatBase, role_data, service_name]}
+      config_settings:
+        map_merge:
+          - get_attr: [HeatBase, role_data, config_settings]
+          - get_attr: [HeatApiLogging, config_settings]
+          - apache::default_vhost: false
+      logging_source: {get_attr: [HeatBase, role_data, logging_source]}
+      logging_groups: {get_attr: [HeatBase, role_data, logging_groups]}
+      service_config_settings: {get_attr: [HeatBase, role_data, service_config_settings]}
+      # BEGIN DOCKER SETTINGS
+      puppet_config:
+        config_volume: heat_api
+        puppet_tags: heat_config,file,concat,file_line
+        step_config:
+          get_attr: [HeatBase, role_data, step_config]
+        config_image: {get_param: DockerHeatApiConfigImage}
+      kolla_config:
+        /var/lib/kolla/config_files/heat_api.json:
+          command: /usr/sbin/httpd -DFOREGROUND
+          config_files:
+            - source: "/var/lib/kolla/config_files/src/*"
+              dest: "/"
+              merge: true
+              preserve_properties: true
+          permissions:
+            - path: /var/log/heat
+              owner: heat:heat
+              recurse: true
+        /var/lib/kolla/config_files/heat_api_cron.json:
+          command: /usr/sbin/crond -n
+          config_files:
+            - source: "/var/lib/kolla/config_files/src/*"
+              dest: "/"
+              merge: true
+              preserve_properties: true
+          permissions:
+            - path: /var/log/heat
+              owner: heat:heat
+              recurse: true
+      docker_config:
+        step_2:
+          get_attr: [HeatApiLogging, docker_config, step_2]
+        step_4:
+          heat_api:
+            image: {get_param: DockerHeatApiImage}
+            net: host
+            privileged: false
+            restart: always
+            # NOTE(mandre) kolla image changes the user to 'heat', we need it
+            # to be root to run httpd
+            user: root
+            healthcheck:
+              test: /openstack/healthcheck
+            volumes:
+              list_concat:
+                - {get_attr: [ContainersCommon, volumes]}
+                - {get_attr: [HeatApiLogging, volumes]}
+                - {get_param: HeatApiOptVolumes}
+                -
+                  - /var/lib/kolla/config_files/heat_api.json:/var/lib/kolla/config_files/config.json:ro
+                  - /var/lib/config-data/puppet-generated/heat_api/:/var/lib/kolla/config_files/src:ro
+                  -
+                    if:
+                      - internal_tls_enabled
+                      - /etc/pki/tls/certs/httpd:/etc/pki/tls/certs/httpd:ro
+                      - ''
+                  -
+                    if:
+                      - internal_tls_enabled
+                      - /etc/pki/tls/private/httpd:/etc/pki/tls/private/httpd:ro
+                      - ''
+            environment:
+                  list_concat:
+                    - {get_param: HeatApiOptEnvVars}
+                    -
+                      - KOLLA_CONFIG_STRATEGY=COPY_ALWAYS
+          heat_api_cron:
+            image: {get_param: DockerHeatApiImage}
+            net: host
+            user: root
+            privileged: false
+            restart: always
+            volumes:
+              list_concat:
+                - {get_attr: [ContainersCommon, volumes]}
+                - {get_attr: [HeatApiLogging, volumes]}
+                -
+                  - /var/lib/kolla/config_files/heat_api_cron.json:/var/lib/kolla/config_files/config.json:ro
+                  - /var/lib/config-data/puppet-generated/heat_api/:/var/lib/kolla/config_files/src:ro
+            environment:
+              - KOLLA_CONFIG_STRATEGY=COPY_ALWAYS
+      host_prep_tasks: {get_attr: [HeatApiLogging, host_prep_tasks]}
+      upgrade_tasks:
+        - name: Check if heat_api is deployed
+          command: systemctl is-enabled --quiet openstack-heat-api
+          tags: common
+          ignore_errors: True
+          register: heat_api_enabled
+        - name: Check for heat_api running under apache
+          tags: common
+          shell: "httpd -t -D DUMP_VHOSTS | grep -q heat_api_wsgi"
+          ignore_errors: True
+          register: httpd_enabled
+        - name: "PreUpgrade step0,validation: Check service openstack-heat-api is running"
+          command: systemctl is-active --quiet openstack-heat-api
+          when:
+            - step|int == 0
+            - heat_api_enabled.rc == 0
+            - httpd_enabled.rc != 0
+          tags: validation
+        - name: Stop and disable heat_api service (pre-upgrade not under httpd)
+          service: name=openstack-heat-api state=stopped enabled=no
+          when:
+            - step|int == 2
+            - heat_api_enabled.rc == 0
+            - httpd_enabled.rc != 0
+        - name: Check if httpd is running
+          tags: common
+          command: systemctl is-active --quiet httpd
+          ignore_errors: True
+          register: httpd_running
+        - name: "PreUpgrade step0,validation: Check if heat_api_wsgi is running"
+          shell: systemctl status 'httpd' | grep -q heat_api_wsgi
+          tags: validation
+          when:
+            - step|int == 0
+            - httpd_enabled.rc == 0
+            - httpd_running.rc == 0
+        - name: Stop heat_api service (running under httpd)
+          service: name=httpd state=stopped
+          when:
+            - step|int == 2
+            - httpd_enabled.rc == 0
+            - httpd_running.rc == 0
+        - name: remove old heat cron jobs
+          when: step|int == 2
+          file:
+            path: /var/spool/cron/heat
+            state: absent
+      metadata_settings:
+        get_attr: [HeatBase, role_data, metadata_settings]
+      fast_forward_upgrade_tasks:
+        - name: FFU check openstack-heat-api is enabled
+          command: systemctl is-enabled openstack-heat-api
+          ignore_errors: True
+          register: heat_api_enabled_result
+          when:
+            - step|int == 0
+            - release == 'ocata'
+        - name: Set fact heat_api_enabled
+          set_fact:
+            heat_api_enabled: "{{ heat_api_enabled_result.rc == 0 }}"
+          when:
+            - step|int == 0
+            - release == 'ocata'
+        - name: FFU stop and disable openstack-heat-api
+          service: name=openstack-heat-api state=stopped enabled=no
+          when:
+            - step|int == 1
+            - release == 'ocata'
+            - heat_api_enabled|bool
+        - name: FFU Heat package update
+          shell: yum -y update openstack-heat*
+          when:
+            - step|int == 6
+            - is_bootstrap_node|bool
+        - name: FFU Heat db-sync
+          command: heat-manage db_sync
+          when:
+            - step|int == 8
+            - is_bootstrap_node|bool
